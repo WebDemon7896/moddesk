@@ -3448,7 +3448,7 @@ def extra_variants(names, leet=False, suffixes=False):
     return out
 
 
-APP_VERSION = "5.0.0"
+APP_VERSION = "5.0.1"
 # Your GitHub repo as owner/name (public). Fills the Settings > Updates box and lets the installer fetch the newest code.
 DEFAULT_UPDATE_REPO = "WebDemon7896/moddesk"
 
