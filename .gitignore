@@ -1,0 +1,18 @@
+# build output and your own data - never commit these
+ModDesk/
+ModDesk-Setup.exe
+_dist/
+_dist2/
+_work/
+_work2/
+_stage/
+payload.zip
+profiles/
+data/
+app.json
+settings.json
+apis.json
+crash.log
+browser-data/
+responses/
+__pycache__/

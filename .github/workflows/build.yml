@@ -1,0 +1,31 @@
+name: Build installer
+
+# Push a tag like v5.0.1 (or press "Run workflow") and GitHub builds ModDesk-Setup.exe for you.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Build ModDesk-Setup.exe
+        shell: cmd
+        run: build.bat
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ModDesk-Setup
+          path: ModDesk-Setup.exe
+      - name: Attach to the release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ModDesk-Setup.exe
