@@ -99,7 +99,6 @@ DEFAULT_SETTINGS = {
     "confirm_delete": True,
     "show_tag_text": True,
     "show_scan": True,
-    "open_external": False,
     "keys": {"discord_token": "", "bloxlink": []},
     "search_templates": DEFAULT_SEARCH,
 }
@@ -1996,8 +1995,6 @@ class App:
         if not hide_core:
             ob = ttk.Button(lb, text="Open", command=lambda: self.open_link(vars_["link"].get()))
             ob.pack(side="left")
-            ob.bind("<Button-2>", lambda e: self.open_external([vars_["link"].get().strip()])
-                    if vars_["link"].get().strip().lower().startswith(("http://", "https://")) else None)
 
         ttk.Label(body, text="Confidence", style="Acct.TLabel").grid(row=row[0], column=0, sticky="w", padx=(0, 6))
         cf = ttk.Frame(body, style="Acct.TFrame")
@@ -2618,9 +2615,7 @@ class App:
             self.aka_entries.append(e)
             ttk.Button(nf, text="✕", width=3,
                        command=lambda a=aka: self.remove_from(node["akas"], a, node)).grid(row=i + 4, column=2)
-            acb, aen = self.conf_widgets(nf, aka, src_width=14)
-            acb.grid(row=i + 4, column=3, padx=2)
-            aen.grid(row=i + 4, column=4)
+
         ttk.Button(nf, text="+ AKA", command=lambda: self.add_aka(node)
                    ).grid(row=len(node["akas"]) + 4, column=1, sticky="w", pady=3)
 
@@ -2732,29 +2727,6 @@ class App:
             pass
 
     def open_in_app(self, urls):
-        """Show pages in a ModDesk window (a separate process, so it never freezes the notebook)."""
-        import subprocess
-        urls = [u for u in urls if u]
-        if not urls:
-            return
-        if self.settings.get("open_external", False):
-            self.open_external(urls)
-            return
-        try:
-            import webview  # noqa: F401
-            ok = True
-        except Exception:  # noqa
-            ok = False
-        if ok:
-            cmd = ([sys.executable] if getattr(sys, "frozen", False)
-                   else [sys.executable, os.path.abspath(__file__)]) + ["--browse"] + urls
-            try:
-                subprocess.Popen(cmd, cwd=APP_DIR)
-                return
-            except OSError as e:
-                self.status("Could not start the app browser (%s); using your browser." % e)
-        else:
-            self.status("In-app browser not installed (run the Setup/build once); opened in your browser instead.")
         self.open_external(urls)
 
     def keybinds(self):
@@ -2999,8 +2971,21 @@ class App:
         self.worker.run(lambda: run_api(cfg, val, self.secrets()), ok, self.error)
 
     def open_external(self, urls):
-        import webbrowser
+        """Open links in the browser chosen in Settings (and its profile), else the system default."""
+        import subprocess
         urls = [u for u in urls if u]
+        if not urls:
+            return
+        cmd = browser_command(self.app_cfg.get("browser"), urls)
+        if cmd:
+            try:
+                subprocess.Popen(cmd, cwd=APP_DIR)
+                return
+            except OSError as e:
+                self.status("Could not start that browser (%s); using the default one." % e)
+        elif (self.app_cfg.get("browser") or {}).get("kind", "default") != "default":
+            self.status("That browser was not found (Settings > General > Browser); using the default one.")
+        import webbrowser
         for i, u in enumerate(urls):
             self.root.after(i * 300, lambda u=u: webbrowser.open_new_tab(u))
 
@@ -3305,7 +3290,7 @@ class KeysDialog(tk.Toplevel):
 
 class FindDialog(tk.Toplevel):
     """Find socials: builds spellings of a person's name (separators, numbers, repeated letters) and opens
-    web searches / profile URLs for the ones you pick, in ModDesk windows. Nothing is collected automatically."""
+    web searches / profile URLs for the ones you pick, in your browser. Nothing is collected automatically."""
 
     def __init__(self, app, node):
         super().__init__(app.root)
@@ -3370,10 +3355,9 @@ class FindDialog(tk.Toplevel):
         ttk.Button(bot, text="Close", command=self.destroy).pack(side="right")
         ob = ttk.Button(bot, text="Open searches", command=self.open_searches)
         ob.pack(side="right", padx=6)
-        ob.bind("<Button-2>", lambda e: self.open_searches(external=True))
         ttk.Button(bot, text="Copy selected variants", command=self.copy_variants).pack(side="right")
         ttk.Label(self, foreground="#666", padding=(8, 0, 8, 8), wraplength=880,
-                  text="Searches open in ModDesk windows (middle-click the button to use your normal browser); nothing is sent anywhere else. Same name or avatar on two "
+                  text="Searches open in your browser (Settings > General > Browser); nothing is sent anywhere else. Same name or avatar on two "
                        "accounts is a lead, not proof - confirm before acting on it.").pack(anchor="w")
         self.vlb.bind("<<ListboxSelect>>", lambda e: self.update_count())
         self.slb.bind("<<ListboxSelect>>", lambda e: self.update_count())
@@ -3495,7 +3479,6 @@ class AvatarDialog(tk.Toplevel):
         for name, tpl in REVERSE_IMAGE:
             sb = ttk.Button(row, text=name, command=lambda t=tpl: self.search(t))
             sb.pack(side="left", padx=2, pady=2)
-            sb.bind("<Button-2>", lambda e, t=tpl: self.search(t, external=True))
         row2 = ttk.Frame(self)
         row2.pack(pady=8)
         ttk.Button(row2, text="Open image", command=self.open_image).pack(side="left", padx=2)
@@ -3931,45 +3914,6 @@ class PresetLibraryDialog(tk.Toplevel):
         self.app.status("Added the %s preset. Use + Add platform to use it." % p["name"])
 
 
-def browse_main(urls):
-    """Entry for 'moddesk.py --browse URL...': shows the pages in app windows (Edge WebView2 through pywebview)."""
-    import webview
-
-    class Api:
-        win = None
-
-        def open_external(self):
-            import webbrowser
-            try:
-                webbrowser.open(self.win.get_current_url())
-            except Exception:  # noqa
-                pass
-
-    js = ("(function(){if(document.getElementById('moddesk-ext'))return;var b=document.createElement('button');"
-          "b.id='moddesk-ext';b.textContent='Open in browser';b.style.cssText='position:fixed;right:12px;bottom:12px;"
-          "z-index:2147483647;padding:8px 12px;border:1px solid #888;border-radius:6px;background:#fff;color:#111;"
-          "font:13px Segoe UI,sans-serif;cursor:pointer;box-shadow:0 1px 4px rgba(0,0,0,.3)';"
-          "b.onclick=function(){if(window.pywebview&&window.pywebview.api){window.pywebview.api.open_external();}};"
-          "(document.body||document.documentElement).appendChild(b);})();")
-    for u in urls:
-        api = Api()
-        w = webview.create_window("ModDesk browser", u, width=1100, height=800, js_api=api)
-        api.win = w
-
-        def on_loaded(win=w):
-            try:
-                win.evaluate_js(js)
-            except Exception:  # noqa
-                pass
-        w.events.loaded += on_loaded
-    store = os.path.join(APP_DIR, "browser-data")
-    try:
-        os.makedirs(store, exist_ok=True)
-        webview.start(private_mode=False, storage_path=store)
-    except TypeError:
-        webview.start()
-
-
 LEET = {"o": "0", "i": "1", "l": "1", "e": "3", "a": "4", "s": "5"}
 
 HANDLE_SUFFIXES = ["_roblox", "rbx", "dc", "yt", "tt", "ig"]
@@ -4001,7 +3945,7 @@ def extra_variants(names, leet=False, suffixes=False):
     return out
 
 
-APP_VERSION = "5.1.0"
+APP_VERSION = "5.1.1"
 # Your GitHub repo as owner/name (public). Fills the Settings > Updates box and lets the installer fetch the newest code.
 DEFAULT_UPDATE_REPO = "WebDemon7896/moddesk"
 
@@ -4065,7 +4009,6 @@ SETTING_TOGGLES = [
     ("auto_link", "Fill ID <-> link automatically when leaving a field"),
     ("autofill_scans", "Autofill also runs scans"),
     ("show_scan", "Show the Scan button on accounts"),
-    ("open_external", "Open links in my normal browser instead of a ModDesk window (middle-click always does)"),
     ("confirm_delete", "Ask before deleting"),
     ("show_tag_text", "Show the tag text next to names in the list"),
 ]
@@ -4083,7 +4026,7 @@ TOUR_PAGES = [
                 "profile. Avatar shows the picture and opens reverse image searches. Autofill does everything it can "
                 "at once. Matches are leads, not proof."),
     ("Find socials", "Builds spellings of the user's names (separators, numbers, leetspeak, repeated letters) and "
-                     "opens a handful of combined searches in a ModDesk window. It never opens dozens of tabs."),
+                     "opens a handful of combined searches in your browser. It never opens dozens of tabs."),
     ("Profiles", "A profile is a separate save file (like a vault): its own users, tags and platform presets. "
                  "File > Switch profile opens the picker again. Your API keys are shared by all profiles."),
     ("Settings", "Settings (Ctrl+,) holds toggles, keyboard shortcuts you can change, API keys, updates and the "
@@ -4093,7 +4036,8 @@ TOUR_PAGES = [
 def load_app_cfg():
     cfg = {"last_profile": "", "ask_on_start": True, "onboarded": False, "terms": "", "tour_pending": False,
            "keys": None, "keybinds": {}, "update_repo": DEFAULT_UPDATE_REPO, "update_branch": "main",
-           "first_profile": "", "auto_update_check": True}
+           "first_profile": "", "auto_update_check": True,
+           "browser": {"kind": "default", "profile": "", "path": "", "args": ""}}
     try:
         with open(APP_CFG_FILE, encoding="utf-8") as f:
             loaded = json.load(f)
@@ -4585,6 +4529,7 @@ class SettingsWindow(tk.Toplevel):
             var.trace_add("write", lambda *a, k=key, v=var: self.app.set_setting(k, v.get()))
             self.vars[key] = var
             ttk.Checkbutton(box, text=label, variable=var).pack(anchor="w", pady=2)
+        self.browser_box(f)
         pb = ttk.LabelFrame(f, text="Profile", padding=10)
         pb.pack(fill="x", pady=12)
         ttk.Label(pb, text="Current profile: %s" % (CURRENT_PROFILE or "(none)"),
@@ -4743,11 +4688,177 @@ class SettingsWindow(tk.Toplevel):
         txt.insert("1.0", TERMS_TEXT)
         txt.configure(state="disabled")
 
+    def browser_box(self, f):
+        cfg = self.app.app_cfg.setdefault("browser", {"kind": "default", "profile": "", "path": "", "args": ""})
+        bf = ttk.LabelFrame(f, text="Browser for links", padding=10)
+        bf.pack(fill="x", pady=(12, 0))
+        labels = {k: v for k, v in BROWSERS}
+        self.bkind = tk.StringVar(value=labels.get(cfg.get("kind", "default"), "System default"))
+        self.bprof = tk.StringVar(value=cfg.get("profile", ""))
+        self.bpath = tk.StringVar(value=cfg.get("path", ""))
+        self.bargs = tk.StringVar(value=cfg.get("args", ""))
+        r1 = ttk.Frame(bf)
+        r1.pack(fill="x")
+        ttk.Label(r1, text="Open links in:").pack(side="left")
+        kc = ttk.Combobox(r1, textvariable=self.bkind, values=[v for _k, v in BROWSERS], state="readonly", width=20)
+        kc.pack(side="left", padx=6)
+        kc.bind("<<ComboboxSelected>>", lambda e: (self.refresh_profiles(), self.save_browser()))
+        ttk.Label(r1, text="Profile:").pack(side="left", padx=(10, 2))
+        self.pcombo = ttk.Combobox(r1, textvariable=self.bprof, width=28)
+        self.pcombo.pack(side="left")
+        r2 = ttk.Frame(bf)
+        r2.pack(fill="x", pady=(6, 0))
+        ttk.Label(r2, text="Program (Other only):").pack(side="left")
+        ttk.Entry(r2, textvariable=self.bpath, width=34).pack(side="left", padx=6)
+        ttk.Button(r2, text="Browse...", command=self.browse_exe).pack(side="left")
+        r3 = ttk.Frame(bf)
+        r3.pack(fill="x", pady=(6, 0))
+        ttk.Label(r3, text="Extra arguments (use {url}):").pack(side="left")
+        ttk.Entry(r3, textvariable=self.bargs, width=34).pack(side="left", padx=6)
+        ttk.Button(r3, text="Test", command=self.test_browser).pack(side="left")
+        ttk.Label(bf, foreground="#555", wraplength=640, justify="left",
+                  text="Pick a browser and, if you use several, the profile (Firefox profile names come from "
+                       "Firefox itself). Firefox opens a different profile only when it is closed or already on "
+                       "that profile. 'System default' uses Windows' default browser.").pack(anchor="w", pady=(6, 0))
+        for v in (self.bprof, self.bpath, self.bargs):
+            v.trace_add("write", lambda *a: self.save_browser())
+        self.refresh_profiles()
+
+    def browser_kind(self):
+        back = {v: k for k, v in BROWSERS}
+        return back.get(self.bkind.get(), "default")
+
+    def refresh_profiles(self):
+        self.pcombo.configure(values=browser_profiles(self.browser_kind()))
+
+    def save_browser(self):
+        self.app.app_cfg["browser"] = {"kind": self.browser_kind(), "profile": self.bprof.get().strip(),
+                                       "path": self.bpath.get().strip(), "args": self.bargs.get().strip()}
+        save_app_cfg(self.app.app_cfg)
+
+    def browse_exe(self):
+        from tkinter import filedialog
+        p = filedialog.askopenfilename(title="Choose a browser program", parent=self,
+                                       filetypes=[("Programs", "*.exe"), ("All files", "*.*")])
+        if p:
+            self.bpath.set(p)
+
+    def test_browser(self):
+        self.save_browser()
+        self.app.open_external(["https://www.example.com"])
+
+
+BROWSERS = [("default", "System default"), ("firefox", "Firefox"), ("chrome", "Google Chrome"),
+            ("edge", "Microsoft Edge"), ("brave", "Brave"), ("custom", "Other program...")]
+
+def find_browser(kind):
+    """Path of an installed browser (PATH, registry 'App Paths', then the usual folders), or ''."""
+    import shutil
+    names = {"firefox": ["firefox.exe", "firefox"], "chrome": ["chrome.exe", "google-chrome", "chrome"],
+             "edge": ["msedge.exe", "microsoft-edge"], "brave": ["brave.exe", "brave-browser", "brave"]}.get(kind)
+    if not names:
+        return ""
+    for n in names:
+        p = shutil.which(n)
+        if p:
+            return p
+    try:
+        import winreg
+        for root in (winreg.HKEY_LOCAL_MACHINE, winreg.HKEY_CURRENT_USER):
+            try:
+                with winreg.OpenKey(root, r"SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\%s" % names[0]) as k:
+                    p = winreg.QueryValue(k, None)
+                    if p and os.path.exists(p):
+                        return p
+            except OSError:
+                continue
+    except ImportError:
+        pass
+    pf, pf86, la = (os.environ.get("ProgramFiles", ""), os.environ.get("ProgramFiles(x86)", ""),
+                    os.environ.get("LOCALAPPDATA", ""))
+    rel = {"firefox": [(pf, "Mozilla Firefox", "firefox.exe"), (pf86, "Mozilla Firefox", "firefox.exe")],
+           "chrome": [(pf, "Google", "Chrome", "Application", "chrome.exe"),
+                      (pf86, "Google", "Chrome", "Application", "chrome.exe"),
+                      (la, "Google", "Chrome", "Application", "chrome.exe")],
+           "edge": [(pf86, "Microsoft", "Edge", "Application", "msedge.exe"),
+                    (pf, "Microsoft", "Edge", "Application", "msedge.exe")],
+           "brave": [(pf, "BraveSoftware", "Brave-Browser", "Application", "brave.exe"),
+                     (la, "BraveSoftware", "Brave-Browser", "Application", "brave.exe")]}[kind]
+    for parts in rel:
+        if parts[0]:
+            p = os.path.join(*parts)
+            if os.path.exists(p):
+                return p
+    return ""
+
+
+def browser_profiles(kind):
+    """Profile names to pick from: Firefox from profiles.ini, Chrome/Edge/Brave from their Local State file."""
+    out = []
+    try:
+        if kind == "firefox":
+            import configparser
+            ini = os.path.join(os.environ.get("APPDATA", ""), "Mozilla", "Firefox", "profiles.ini")
+            cp = configparser.ConfigParser()
+            cp.read(ini, encoding="utf-8")
+            for sec in cp.sections():
+                if sec.lower().startswith("profile") and cp.has_option(sec, "Name"):
+                    out.append(cp.get(sec, "Name"))
+        elif kind in ("chrome", "edge", "brave"):
+            la = os.environ.get("LOCALAPPDATA", "")
+            path = {"chrome": os.path.join(la, "Google", "Chrome", "User Data", "Local State"),
+                    "edge": os.path.join(la, "Microsoft", "Edge", "User Data", "Local State"),
+                    "brave": os.path.join(la, "BraveSoftware", "Brave-Browser", "User Data", "Local State")}[kind]
+            with open(path, encoding="utf-8") as f:
+                cache = json.load(f).get("profile", {}).get("info_cache", {})
+            for d, info in cache.items():
+                out.append("%s (%s)" % (info.get("name", d), d))
+    except Exception:  # noqa - not installed / no such file
+        pass
+    return out
+
+
+def browser_command(cfg, urls):
+    """argv list that opens urls in the chosen browser/profile, or None for the system default."""
+    kind = (cfg or {}).get("kind", "default")
+    prof = (cfg or {}).get("profile", "").strip()
+    if kind == "default":
+        return None
+    if kind == "custom":
+        path = (cfg.get("path") or "").strip().strip('"')
+        if not path:
+            return None
+        args = (cfg.get("args") or "").strip()
+        if "{url}" in args:
+            import shlex
+            toks = [t.strip('"') for t in shlex.split(args, posix=False)]
+            cmd = [path]
+            for t in toks:
+                if "{url}" in t:
+                    cmd += [t.replace("{url}", u) for u in urls]
+                else:
+                    cmd.append(t)
+            return cmd
+        return [path] + ([a.strip('"') for a in args.split()] if args else []) + list(urls)
+    exe = (cfg.get("path") or "").strip().strip('"') if kind == (cfg.get("path_kind") or "") else ""
+    exe = exe or find_browser(kind)
+    if not exe:
+        return None
+    if kind == "firefox":
+        cmd = [exe]
+        if prof:
+            cmd += ["-P", prof]
+        for u in urls:
+            cmd += ["-new-tab", u]
+        return cmd
+    cmd = [exe]
+    if prof:
+        m = re.search(r"\(([^()]+)\)\s*$", prof)
+        cmd.append("--profile-directory=%s" % (m.group(1) if m else prof))
+    return cmd + list(urls)
+
 
 def main():
-    if "--browse" in sys.argv:
-        browse_main([a for a in sys.argv[sys.argv.index("--browse") + 1:] if a.startswith(("http://", "https://"))])
-        return
     try:
         import ctypes
         ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("ModDesk.App")  # own taskbar identity

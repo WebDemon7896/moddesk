@@ -14,10 +14,6 @@ def _bundle():
     import urllib.error, urllib.parse, urllib.request, uuid, webbrowser, zlib, zipfile  # noqa
     import tkinter, tkinter.ttk, tkinter.messagebox, tkinter.filedialog, tkinter.colorchooser  # noqa
     import tkinter.simpledialog, tkinter.font  # noqa
-    try:
-        import webview  # noqa  (in-app browser windows; optional)
-    except Exception:  # noqa
-        pass
 
 
 HERE = os.path.dirname(sys.executable) if getattr(sys, "frozen", False) else os.path.dirname(os.path.abspath(__file__))

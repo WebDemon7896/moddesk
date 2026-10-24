@@ -27,10 +27,6 @@ if errorlevel 1 (
   if not defined CI pause
   exit /b 1
 )
-rem Optional: in-app browser windows (uses the Edge WebView2 that Windows 10/11 already has).
-python -m pip install --upgrade pywebview
-if errorlevel 1 echo (pywebview could not be installed - links will open in your normal browser instead.)
-
 set ICONARG=
 if exist icon.ico set ICONARG=--icon "%~dp0icon.ico"
 
@@ -38,7 +34,7 @@ if exist _dist rmdir /s /q _dist
 if exist _stage rmdir /s /q _stage
 python -m PyInstaller --noconfirm --onedir --windowed --name ModDesk %ICONARG% ^
   --distpath "%~dp0_dist" --workpath "%~dp0_work" --specpath "%~dp0_work" ^
-  --collect-all webview --exclude-module unittest --exclude-module pydoc --exclude-module doctest ^
+  --exclude-module unittest --exclude-module pydoc --exclude-module doctest ^
   "%~dp0launcher.py"
 if errorlevel 1 (
   echo Build failed.
