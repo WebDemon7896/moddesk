@@ -38,7 +38,7 @@ COLORS = [("None", ""), ("Red", "#e5484d"), ("Yellow", "#f5c518"), ("Blue", "#3b
 
 BUTTON_SETS = {"": "None", "roblox": "Roblox buttons", "discord": "Discord buttons"}
 
-SETTINGS_VERSION = 3
+SETTINGS_VERSION = 4
 
 APIS_VERSION = 4
 
@@ -52,6 +52,9 @@ DEFAULT_PRESETS = [
      "display_name": True, "fields": ["Bio"], "buttons": "roblox", "default": True},
     {"name": "Discord", "link_template": "https://discord.com/users/{id}",
      "display_name": True, "fields": [], "buttons": "discord", "default": True},
+    {"name": "Real life", "link_template": "", "display_name": False, "hide_core": True,
+     "fields": ["Real name", "Location", "Timezone", "Birthday", "Phone", "Email", "How we know each other"],
+     "buttons": "", "default": False},
 ]
 DEFAULT_TAGS = [
     {"id": "t-red", "name": "Flagged", "color": "#e5484d"},
@@ -96,6 +99,7 @@ DEFAULT_SETTINGS = {
     "confirm_delete": True,
     "show_tag_text": True,
     "show_scan": True,
+    "open_external": False,
     "keys": {"discord_token": "", "bloxlink": []},
     "search_templates": DEFAULT_SEARCH,
 }
@@ -220,7 +224,8 @@ def apply_extract(parsed, spec):
     return fmt(dig(parsed, spec))
 
 
-SECRET_LABELS = {"discord_token": "Discord bot token", "bloxlink": "a Bloxlink server ID + key"}
+SECRET_LABELS = {"discord_token": "Discord bot token", "bloxlink": "a Bloxlink server ID + key",
+                 "steam_key": "a Steam Web API key"}
 
 KEY_COOLDOWN = {}  # key -> time until which it is skipped (rate limited / rejected)
 
@@ -276,6 +281,7 @@ def fill_template(text, value, secrets, key, mode, guild=""):
     pairs = {"value": str(value),
              "discord_token": (secrets.get("discord_token") or "").strip(),
              "bloxlink_guild": guild or "",
+             "steam_key": (secrets.get("steam_key") or "").strip(),
              "key": key or ""}
     for k, v in pairs.items():
         text = text.replace("{%s}" % k, quote(v))
@@ -525,8 +531,10 @@ class Worker:
 class EditableLabel(ttk.Frame):
     """A plain label. Right-click > Rename (or double-click) turns it into an entry; Enter / click away commits."""
 
-    def __init__(self, parent, text, on_commit, on_cancel=None, editing=False, extra_menu=None, width=14, font=None):
-        super().__init__(parent)
+    def __init__(self, parent, text, on_commit, on_cancel=None, editing=False, extra_menu=None, width=14, font=None,
+                 tone=""):
+        super().__init__(parent, **({"style": tone + ".TFrame"} if tone else {}))
+        self.lstyle = tone + ".TLabel" if tone else ""
         self.text = text
         self.on_commit = on_commit
         self.on_cancel = on_cancel
@@ -546,7 +554,7 @@ class EditableLabel(ttk.Frame):
 
     def show(self):
         self.clear()
-        lbl = ttk.Label(self, text=self.text, font=self.font)
+        lbl = ttk.Label(self, text=self.text, font=self.font, **({"style": self.lstyle} if self.lstyle else {}))
         lbl.pack(anchor="w")
         lbl.bind("<Button-3>", self.popup)
         lbl.bind("<Double-Button-1>", lambda e: self.edit())
@@ -982,6 +990,8 @@ class App:
             for p in s["presets"]:
                 if str(p.get("name", "")).lower() == "roblox" and "Bio" not in p.get("fields", []):
                     p.setdefault("fields", []).append("Bio")
+        if old_version < 4 and not any(str(p.get("name", "")).lower() == "real life" for p in s["presets"]):
+            s["presets"].append(json.loads(json.dumps(REAL_LIFE_PRESET)))
         s["version"] = SETTINGS_VERSION
         for p in s["presets"]:
             p.setdefault("link_template", "")
@@ -999,7 +1009,8 @@ class App:
         if isinstance(old_keys, list):  # v3 layout: one server ID + a list of keys -> pairs
             for k in old_keys:
                 pairs.append({"guild": str(keys.get("bloxlink_guild", "")), "key": str(k)})
-        s["keys"] = {"discord_token": str(keys.get("discord_token", "")), "bloxlink": pairs}
+        s["keys"] = {"discord_token": str(keys.get("discord_token", "")), "bloxlink": pairs,
+                     "steam_key": str(keys.get("steam_key", ""))}
         if not isinstance(s.get("tags"), list):
             s["tags"] = json.loads(json.dumps(DEFAULT_TAGS))
         for t in s["tags"]:
@@ -1071,11 +1082,16 @@ class App:
     def load_apis(self):
         apis = json.loads(json.dumps(DEFAULT_APIS))
         current = False
+        missing = False
         if os.path.exists(API_FILE):
             try:
                 with open(API_FILE, encoding="utf-8") as f:
                     loaded = json.load(f)
                 if isinstance(loaded, dict) and loaded.get("_version", 1) >= APIS_VERSION:
+                    for k, v in DEFAULT_APIS.items():   # new built-in entries appear without touching your edits
+                        if k not in loaded:
+                            loaded[k] = v
+                            missing = True
                     apis.update(loaded)
                     current = True
                 else:
@@ -1084,10 +1100,10 @@ class App:
             except Exception as e:  # noqa
                 messagebox.showwarning(APP_NAME, "apis.json has a problem (%s). Using defaults until it is fixed." % e)
                 return apis
-        if not current:
+        if not current or missing:
             try:
                 with open(API_FILE, "w", encoding="utf-8") as f:
-                    json.dump(DEFAULT_APIS, f, indent=2, ensure_ascii=False)
+                    json.dump(apis if current else DEFAULT_APIS, f, indent=2, ensure_ascii=False)
             except OSError:
                 pass
         return apis
@@ -1197,6 +1213,10 @@ class App:
     def build_ui(self):
         style = ttk.Style()
         style.configure("Treeview", rowheight=24)
+        self.plat_bg, self.acct_bg, self.head_bg = "#d4d4da", "#f8f8f9", "#e6e6ea"
+        for tone, bg in (("Plat", self.plat_bg), ("Acct", self.acct_bg)):
+            style.configure(tone + ".TFrame", background=bg)
+            style.configure(tone + ".TLabel", background=bg)
         self.frame_bg = style.lookup("TFrame", "background") or self.root.cget("bg")
         try:
             self.root.configure(bg=self.frame_bg)
@@ -1222,6 +1242,7 @@ class App:
         sm.add_command(label="Settings...", command=self.open_settings, accelerator="Ctrl+,")
         sm.add_separator()
         sm.add_command(label="Platform presets...", command=lambda: PresetsDialog(self))
+        sm.add_command(label="Preset library (GitHub, Bluesky, Steam...)", command=lambda: PresetLibraryDialog(self))
         sm.add_command(label="Tags (colors)...", command=lambda: TagsDialog(self))
         sm.add_command(label="API keys...", command=lambda: KeysDialog(self))
         sm.add_separator()
@@ -1863,13 +1884,13 @@ class App:
         self.rerender(node)
 
     def render_platform(self, parent, node, plat):
-        pf = ttk.Frame(parent, relief="ridge", borderwidth=1, padding=6)
+        pf = ttk.Frame(parent, style="Plat.TFrame", relief="ridge", borderwidth=1, padding=6)
         pf.pack(fill="x", pady=4)
-        head = ttk.Frame(pf)
+        head = ttk.Frame(pf, style="Plat.TFrame")
         head.pack(fill="x")
         EditableLabel(head, plat["platform"], lambda t: self.platform_renamed(node, plat, t),
                       extra_menu=[("Delete platform", lambda: self.delete_platform(node, plat))],
-                      width=20, font=("Segoe UI", 10, "bold")).pack(side="left")
+                      width=20, font=("Segoe UI", 10, "bold"), tone="Plat").pack(side="left")
         ttk.Button(head, text="+ Account",
                    command=lambda: self.append_to(plat["entries"], new_entry(self.preset_of(plat)), node)
                    ).pack(side="left", padx=8)
@@ -1880,18 +1901,25 @@ class App:
 
     def entry_summary(self, ent):
         main = ent.get("username", "").strip() or ent.get("display", "").strip() or ent.get("id", "").strip()
+        if not main:
+            x = next((x for x in ent.get("extra", []) if x.get("value", "").strip()), None)
+            if x:
+                main = "%s: %s" % (x.get("key", "").strip() or "field", x["value"].strip())
         text = main or "(empty account)"
         if ent.get("username", "").strip() and ent.get("display", "").strip():
             text += "  •  " + ent["display"].strip()
         if ent.get("id", "").strip() and main != ent["id"].strip():
             text += "  •  ID " + ent["id"].strip()
+        lvl = (ent.get("conf") or {}).get("level") if isinstance(ent.get("conf"), dict) else ""
+        if lvl:
+            text += "  [%s]" % lvl
         return text
 
     def render_entry(self, parent, node, plat, ent, preset):
         kind = preset.get("buttons", "")
         main = bool(ent.get("main"))
-        edge = "#e0a800" if main else "#bdbdbd"
-        box = tk.Frame(parent, bg=self.frame_bg, bd=0, highlightthickness=2 if main else 1,
+        edge = "#e0a800" if main else "#85858c"
+        box = tk.Frame(parent, bg=self.acct_bg, bd=0, highlightthickness=2 if main else 1,
                        highlightbackground=edge, highlightcolor=edge)
         box.pack(fill="x", pady=3)
         collapsed = ent.get("collapsed", False)
@@ -1900,28 +1928,33 @@ class App:
         if collapsed:
             return
 
-        body = ttk.Frame(box, padding=4)
+        body = ttk.Frame(box, padding=4, style="Acct.TFrame")
         body.pack(fill="x")
         body.columnconfigure(1, weight=1)
         vars_ = {}
         row = [0]
 
         def add_row(text, key):
-            ttk.Label(body, text=text).grid(row=row[0], column=0, sticky="w", padx=(0, 6))
+            ttk.Label(body, text=text, style="Acct.TLabel").grid(row=row[0], column=0, sticky="w", padx=(0, 6))
             e, v = self.entry_bound(body, ent, key, fkey=("ent", id(ent), key))
             e.grid(row=row[0], column=1, sticky="ew", pady=1)
-            bf = ttk.Frame(body)
+            bf = ttk.Frame(body, style="Acct.TFrame")
             bf.grid(row=row[0], column=2, sticky="w", padx=4)
             vars_[key] = v
             row[0] += 1
             v.trace_add("write", lambda *a: set_summary(self.entry_summary(ent)))
             return e, bf
 
-        eu, ub = add_row("Username", "username")
-        if preset.get("display_name"):
-            add_row("Display Name", "display")
-        ei, ib = add_row("ID", "id")
-        el, lb = add_row("Link", "link")
+        hide_core = bool(preset.get("hide_core"))
+        if hide_core:                       # e.g. "Real life": only the preset's own fields
+            eu = ei = el = None
+            ub = ib = lb = ttk.Frame(body)  # never shown
+        else:
+            eu, ub = add_row("Username", "username")
+            if preset.get("display_name"):
+                add_row("Display Name", "display")
+            ei, ib = add_row("ID", "id")
+            el, lb = add_row("Link", "link")
 
         # Only a field you actually changed drives the others, so you can clear a link or ID without it coming back.
         seen = {}
@@ -1933,6 +1966,8 @@ class App:
             if k in seen and seen[k] != vars_[k].get():
                 self.link_id_sync(plat, ent, vars_, src=k)
         for w, k in ((eu, "username"), (ei, "id"), (el, "link")):
+            if w is None:
+                continue
             w.bind("<FocusIn>", lambda ev, k=k: focus_in(ev, k), add="+")
             w.bind("<FocusOut>", lambda ev, k=k: focus_out(ev, k), add="+")
 
@@ -1950,7 +1985,28 @@ class App:
             if self.settings.get("show_scan", True):
                 ttk.Button(ib, text="Scan", command=lambda: self.scan(node, plat, kind, ent)).pack(side="left", padx=2)
             ttk.Button(ib, text="Avatar", command=lambda: AvatarDialog(self, node, plat, ent, kind)).pack(side="left")
-        ttk.Button(lb, text="Open", command=lambda: self.open_link(vars_["link"].get())).pack(side="left")
+        if kind not in ("roblox", "discord") and not hide_core:
+            for lk in preset.get("lookups", []):
+                host = ub if lk.get("src") == "username" else ib
+                ttk.Button(host, text=lk.get("label", "lookup"), command=lambda lk=lk: self.convert(
+                    lk["api"], node, plat, ent, lk["src"], lk["dst"])).pack(side="left", padx=1)
+            if preset.get("scan") and self.settings.get("show_scan", True):
+                ttk.Button(ib, text="Scan", command=lambda: self.generic_scan(node, plat, ent, preset)).pack(
+                    side="left", padx=2)
+        if not hide_core:
+            ob = ttk.Button(lb, text="Open", command=lambda: self.open_link(vars_["link"].get()))
+            ob.pack(side="left")
+            ob.bind("<Button-2>", lambda e: self.open_external([vars_["link"].get().strip()])
+                    if vars_["link"].get().strip().lower().startswith(("http://", "https://")) else None)
+
+        ttk.Label(body, text="Confidence", style="Acct.TLabel").grid(row=row[0], column=0, sticky="w", padx=(0, 6))
+        cf = ttk.Frame(body, style="Acct.TFrame")
+        cf.grid(row=row[0], column=1, sticky="ew", pady=1)
+        ccb, cen = self.conf_widgets(cf, ent, on_change=lambda: set_summary(self.entry_summary(ent)))
+        ccb.pack(side="left")
+        ttk.Label(cf, text="found via", style="Acct.TLabel").pack(side="left", padx=(8, 4))
+        cen.pack(side="left", fill="x", expand=True)
+        row[0] += 1
 
         # custom fields: the title is a normal label (right-click to rename / delete)
         for x in ent.get("extra", []):
@@ -1960,19 +2016,31 @@ class App:
                 on_commit=lambda t, x=x: self.field_titled(node, x, t),
                 on_cancel=lambda x=x: self.field_cancelled(node, ent, x),
                 editing=new_field,
-                extra_menu=[("Delete field", lambda x=x: self.remove_from(ent["extra"], x, node))])
+                extra_menu=[("Delete field", lambda x=x: self.remove_from(ent["extra"], x, node))], tone="Acct")
             lab.grid(row=row[0], column=0, sticky="w", padx=(0, 6))
             e, _v = self.entry_bound(body, x, "value", fkey=("xval", id(x)))
             e.grid(row=row[0], column=1, sticky="ew", pady=1)
+            kl = x.get("key", "").strip().lower()
+            if kl in ("timezone", "time zone", "tz"):
+                hf = ttk.Frame(body, style="Acct.TFrame")
+                hf.grid(row=row[0], column=2, sticky="w", padx=4)
+                hl = ttk.Label(hf, text=tz_now_text(x.get("value", "")), style="Acct.TLabel")
+                ttk.Button(hf, text="Work out...", command=lambda v=_v: TimezoneDialog(self, v.set)).pack(side="left")
+                hl.pack(side="left", padx=6)
+                _v.trace_add("write", lambda *a, v=_v, hl=hl: hl.configure(text=tz_now_text(v.get())))
+            elif kl in ("birthday", "birthdate", "birth date", "date of birth", "dob"):
+                hl = ttk.Label(body, text=birthday_hint(x.get("value", "")), style="Acct.TLabel")
+                hl.grid(row=row[0], column=2, sticky="w", padx=4)
+                _v.trace_add("write", lambda *a, v=_v, hl=hl: hl.configure(text=birthday_hint(v.get())))
             row[0] += 1
 
-        fr = ttk.Frame(body)
+        fr = ttk.Frame(body, style="Acct.TFrame")
         fr.grid(row=row[0], column=0, columnspan=3, sticky="w", pady=(4, 0))
         ttk.Button(fr, text="+ Field", command=lambda: self.append_to(
             ent["extra"], {"key": "", "value": ""}, node)).pack(side="left")
         row[0] += 1
 
-        ttk.Label(body, text="Notes / scan output").grid(row=row[0], column=0, columnspan=3, sticky="w", pady=(6, 0))
+        ttk.Label(body, text="Notes / scan output", style="Acct.TLabel").grid(row=row[0], column=0, columnspan=3, sticky="w", pady=(6, 0))
         self.text_bound(body, ent, "notes", 5).grid(row=row[0] + 1, column=0, columnspan=3, sticky="ew")
 
     def field_titled(self, node, x, text):
@@ -2529,6 +2597,10 @@ class App:
         em, vmain = self.entry_bound(nf, node, "main_name", fkey=("main",))
         em.grid(row=0, column=1, sticky="ew", padx=4, pady=1)
         self.main_entry = em
+        ucb, uen = self.conf_widgets(nf, node, src_width=14)
+        ucb.grid(row=0, column=3, padx=2)
+        uen.grid(row=0, column=4)
+        ttk.Label(nf, foreground="#666", text="confidence / found via").grid(row=3, column=3, columnspan=2, sticky="w")
         ttk.Label(nf, text="Real name").grid(row=1, column=0, sticky="w")
         er, _v = self.entry_bound(nf, node, "real_name", fkey=("real",))
         er.grid(row=1, column=1, sticky="ew", padx=4, pady=1)
@@ -2546,6 +2618,9 @@ class App:
             self.aka_entries.append(e)
             ttk.Button(nf, text="✕", width=3,
                        command=lambda a=aka: self.remove_from(node["akas"], a, node)).grid(row=i + 4, column=2)
+            acb, aen = self.conf_widgets(nf, aka, src_width=14)
+            acb.grid(row=i + 4, column=3, padx=2)
+            aen.grid(row=i + 4, column=4)
         ttk.Button(nf, text="+ AKA", command=lambda: self.add_aka(node)
                    ).grid(row=len(node["akas"]) + 4, column=1, sticky="w", pady=3)
 
@@ -2574,6 +2649,8 @@ class App:
         for plat in node["accounts"]:
             self.render_platform(af, node, plat)
 
+        self.build_links(inner, node)
+
         # notes
         nof = ttk.LabelFrame(inner, text="Notes", padding=6)
         nof.pack(fill="x", padx=8, pady=6)
@@ -2583,7 +2660,7 @@ class App:
         """Header row of one account: [-]/[+] like a tree, star, summary, Delete. Starred = gold gradient."""
         h = 30
         end_bg = "#fff8dc"
-        c = tk.Canvas(parent, height=h, bg=end_bg if main else self.frame_bg, highlightthickness=0, bd=0)
+        c = tk.Canvas(parent, height=h, bg=end_bg if main else self.head_bg, highlightthickness=0, bd=0)
         if main:
             if self.gradient_img is None:
                 self.gradient_img = self.make_gradient(760, h, "#ffd34d", end_bg)
@@ -2620,7 +2697,7 @@ class App:
             val = " ".join(fmt(dig(parsed, path)).split())
             if not val:
                 continue
-            if target in ("username", "display", "id"):
+            if target in ("username", "display", "id", "link"):
                 cur = ent.get(target, "").strip()
                 if not cur or (cur.lower() == val.lower() and cur != val):
                     ent[target] = val
@@ -2660,6 +2737,9 @@ class App:
         urls = [u for u in urls if u]
         if not urls:
             return
+        if self.settings.get("open_external", False):
+            self.open_external(urls)
+            return
         try:
             import webview  # noqa: F401
             ok = True
@@ -2674,10 +2754,8 @@ class App:
             except OSError as e:
                 self.status("Could not start the app browser (%s); using your browser." % e)
         else:
-            self.status("In-app browser not installed (run build.bat once); opened in your browser instead.")
-        import webbrowser
-        for i, u in enumerate(urls):
-            self.root.after(i * 300, lambda u=u: webbrowser.open_new_tab(u))
+            self.status("In-app browser not installed (run the Setup/build once); opened in your browser instead.")
+        self.open_external(urls)
 
     def keybinds(self):
         b = dict(DEFAULT_KEYBINDS)
@@ -2826,6 +2904,106 @@ class App:
             msg_var.set("Could not check: %s (is the repo public and does it contain moddesk.py?)" % e)
         self.worker.run(work, ok, err)
 
+    def conf_widgets(self, parent, obj, on_change=None, src_width=18, tone=""):
+        """Confidence level + 'found via' note for any record (user, account, AKA)."""
+        c = obj.get("conf")
+        if not isinstance(c, dict):
+            c = obj["conf"] = {"level": "", "source": ""}
+        lvl = tk.StringVar(value=c.get("level") or CONF_NONE)
+        cb = ttk.Combobox(parent, textvariable=lvl, values=[CONF_NONE] + CONF_LEVELS[1:], state="readonly", width=10)
+
+        def picked(_e=None):
+            c["level"] = "" if lvl.get() == CONF_NONE else lvl.get()
+            self.changed()
+            if on_change:
+                on_change()
+        cb.bind("<<ComboboxSelected>>", picked)
+        src = tk.StringVar(value=c.get("source", ""))
+
+        def typed(*_a):
+            c["source"] = src.get()
+            self.changed()
+        src.trace_add("write", typed)
+        en = ttk.Entry(parent, textvariable=src, width=src_width)
+        return cb, en
+
+    def user_label(self, n):
+        return n.get("name") or n.get("main_name") or "(unnamed)"
+
+    def build_links(self, inner, node):
+        """Linked people: pick another user and say how they are connected; the other side shows it too."""
+        links = node.setdefault("links", [])
+        lf = ttk.LabelFrame(inner, text="Linked people", padding=6)
+        lf.pack(fill="x", padx=8, pady=6)
+        others = [n for n in walk_nodes(self.data["items"]) if n.get("type") == "user" and n["id"] != node["id"]]
+        labels, seen = {}, {}
+        for n in others:
+            base = self.user_label(n)
+            seen[base] = seen.get(base, 0) + 1
+            labels[n["id"]] = base if seen[base] == 1 else "%s (%d)" % (base, seen[base])
+        choices = [labels[n["id"]] for n in others]
+        by_label = {v: k for k, v in labels.items()}
+        for lk in links:
+            row = ttk.Frame(lf)
+            row.pack(fill="x", pady=1)
+            var = tk.StringVar(value=labels.get(lk.get("to"), ""))
+            cb = ttk.Combobox(row, textvariable=var, values=choices, state="readonly", width=26)
+            cb.pack(side="left")
+
+            def picked(_e=None, lk=lk, var=var):
+                lk["to"] = by_label.get(var.get(), "")
+                self.changed()
+            cb.bind("<<ComboboxSelected>>", picked)
+            ttk.Label(row, text="how:").pack(side="left", padx=(8, 2))
+            e, _v = self.entry_bound(row, lk, "rel", fkey=("rel", id(lk)))
+            e.configure(width=24)
+            e.pack(side="left")
+            ttk.Button(row, text="Open", width=6, command=lambda lk=lk: self.open_person(lk.get("to"))).pack(
+                side="left", padx=4)
+            ttk.Button(row, text="✕", width=3, command=lambda lk=lk: self.remove_from(links, lk, node)).pack(
+                side="left")
+        back = []
+        for n in others:
+            for lk in n.get("links", []):
+                if lk.get("to") == node["id"]:
+                    back.append("%s%s" % (labels[n["id"]], " (%s)" % lk["rel"] if lk.get("rel") else ""))
+        if back:
+            ttk.Label(lf, foreground="#555", wraplength=640, justify="left",
+                      text="Also linked from: " + ", ".join(back)).pack(anchor="w", pady=(4, 0))
+        ttk.Button(lf, text="+ Link a person", command=lambda: self.append_to(
+            links, {"to": "", "rel": ""}, node)).pack(anchor="w", pady=(4, 0))
+
+    def open_person(self, pid):
+        if pid and self.locate(pid):
+            self.rebuild_tree(select=pid)
+            self.root.after(50, lambda: self.on_select(None))
+
+    def generic_scan(self, node, plat, ent, preset):
+        api = preset.get("scan")
+        cfg = self.apis.get(api)
+        src = preset.get("scan_src", "id")
+        val = (ent.get(src) or ent.get("id") or ent.get("username") or "").strip()
+        if not val:
+            self.status("Fill the username or ID first.")
+            return
+        self.status("Scanning...")
+
+        def ok(res):
+            text, parsed = res
+            self.apply_fill(plat, ent, cfg, parsed)
+            self.add_scan_note(ent, preset.get("name", "scan").lower(), val, text or "(nothing found)")
+            self.link_id_sync(plat, ent, force=True)
+            self.changed()
+            self.rerender(node)
+            self.status("Scan finished.")
+        self.worker.run(lambda: run_api(cfg, val, self.secrets()), ok, self.error)
+
+    def open_external(self, urls):
+        import webbrowser
+        urls = [u for u in urls if u]
+        for i, u in enumerate(urls):
+            self.root.after(i * 300, lambda u=u: webbrowser.open_new_tab(u))
+
 
 class TagsDialog(tk.Toplevel):
     """Settings > Tags: named colors you can put on users (dropdown in the editor, dot in the list)."""
@@ -2970,8 +3148,8 @@ class KeysDialog(tk.Toplevel):
         self.keys = app.settings["keys"]
         self.rows = []  # (frame, guild_var, key_var, key_entry)
         self.title("API keys")
-        self.geometry("640x580")
-        self.minsize(580, 540)
+        self.geometry("640x650")
+        self.minsize(580, 600)
         pad = ttk.Frame(self, padding=10)
         pad.pack(fill="both", expand=True)
         pad.columnconfigure(0, weight=1)
@@ -3014,15 +3192,20 @@ class KeysDialog(tk.Toplevel):
         self.res_var = tk.StringVar(value="")
         ttk.Label(pad, textvariable=self.res_var, wraplength=580, justify="left").grid(
             row=8, column=0, sticky="w", pady=4)
+        ttk.Label(pad, text="Steam Web API key (optional, for the Steam preset)", font=("Segoe UI", 10, "bold")).grid(
+            row=9, column=0, sticky="w", pady=(6, 0))
+        self.steam_var = tk.StringVar(value=self.keys.get("steam_key", ""))
+        ttk.Entry(pad, textvariable=self.steam_var, show="•").grid(row=10, column=0, sticky="ew", pady=2)
         ttk.Label(pad, foreground="#a15c00", wraplength=580, justify="left",
-                  text="Keys are saved as plain text in settings.json next to the program. Do not share that file."
-                  ).grid(row=9, column=0, sticky="w")
+                  text="Keys are saved as plain text in app.json next to the program. Do not share that file."
+                  ).grid(row=11, column=0, sticky="w", pady=(6, 0))
 
         for it in self.keys.get("bloxlink", []):
             self.add_row(str(it.get("guild", "")), str(it.get("key", "")), False)
         if not self.rows:
             self.add_row("", "", False)
         self.tok_var.trace_add("write", self.commit)
+        self.steam_var.trace_add("write", self.commit)
 
     def toggle_show(self):
         mask = "" if self.show_var.get() else "•"
@@ -3060,6 +3243,7 @@ class KeysDialog(tk.Toplevel):
 
     def commit(self, *_):
         self.keys["discord_token"] = self.tok_var.get().strip()
+        self.keys["steam_key"] = self.steam_var.get().strip()
         self.keys["bloxlink"] = self.pairs()
         self.keys.pop("bloxlink_guild", None)
         self.keys.pop("bloxlink_keys", None)
@@ -3184,10 +3368,12 @@ class FindDialog(tk.Toplevel):
         self.count_lbl = ttk.Label(bot, text="")
         self.count_lbl.pack(side="left")
         ttk.Button(bot, text="Close", command=self.destroy).pack(side="right")
-        ttk.Button(bot, text="Open searches", command=self.open_searches).pack(side="right", padx=6)
+        ob = ttk.Button(bot, text="Open searches", command=self.open_searches)
+        ob.pack(side="right", padx=6)
+        ob.bind("<Button-2>", lambda e: self.open_searches(external=True))
         ttk.Button(bot, text="Copy selected variants", command=self.copy_variants).pack(side="right")
         ttk.Label(self, foreground="#666", padding=(8, 0, 8, 8), wraplength=880,
-                  text="Searches open in ModDesk windows; nothing is sent anywhere else. Same name or avatar on two "
+                  text="Searches open in ModDesk windows (middle-click the button to use your normal browser); nothing is sent anywhere else. Same name or avatar on two "
                        "accounts is a lead, not proof - confirm before acting on it.").pack(anchor="w")
         self.vlb.bind("<<ListboxSelect>>", lambda e: self.update_count())
         self.slb.bind("<<ListboxSelect>>", lambda e: self.update_count())
@@ -3272,7 +3458,7 @@ class FindDialog(tk.Toplevel):
         self.clipboard_append("\n".join(vs))
         self.app.status("Copied %d variant(s)." % len(vs))
 
-    def open_searches(self):
+    def open_searches(self, external=False):
         urls = self.urls()
         if not urls:
             self.app.status("Nothing selected.")
@@ -3283,7 +3469,7 @@ class FindDialog(tk.Toplevel):
                                 "for many names; use Profile guess sites only for your best 2-3 variants." % (
                                     len(urls), MAX_WINDOWS), parent=self)
             return
-        self.app.open_in_app(urls)
+        (self.app.open_external if external else self.app.open_in_app)(urls)
 
 
 class AvatarDialog(tk.Toplevel):
@@ -3307,7 +3493,9 @@ class AvatarDialog(tk.Toplevel):
         row = ttk.Frame(self)
         row.pack()
         for name, tpl in REVERSE_IMAGE:
-            ttk.Button(row, text=name, command=lambda t=tpl: self.search(t)).pack(side="left", padx=2, pady=2)
+            sb = ttk.Button(row, text=name, command=lambda t=tpl: self.search(t))
+            sb.pack(side="left", padx=2, pady=2)
+            sb.bind("<Button-2>", lambda e, t=tpl: self.search(t, external=True))
         row2 = ttk.Frame(self)
         row2.pack(pady=8)
         ttk.Button(row2, text="Open image", command=self.open_image).pack(side="left", padx=2)
@@ -3357,11 +3545,12 @@ class AvatarDialog(tk.Toplevel):
             self.msg.set(str(e))
         app.worker.run(work, ok, err)
 
-    def search(self, tpl):
+    def search(self, tpl, external=False):
         if not self.url:
             self.msg.set("No image yet.")
             return
-        self.app.open_in_app([tpl.replace("{u}", urllib.parse.quote(self.url, safe=""))])
+        u = tpl.replace("{u}", urllib.parse.quote(self.url, safe=""))
+        (self.app.open_external if external else self.app.open_in_app)([u])
 
     def open_image(self):
         if self.url:
@@ -3404,11 +3593,375 @@ def plan_searches(variants, templates, chunk=OR_CHUNK):
     return out
 
 
+CONF_LEVELS = ["", "Confirmed", "Likely", "Possible", "Guess"]
+
+CONF_NONE = "—"
+
+TZ_ABBR = {"EST": -5, "EDT": -4, "CST": -6, "CDT": -5, "MST": -7, "MDT": -6, "PST": -8, "PDT": -7, "AKST": -9,
+           "AKDT": -8, "HST": -10, "AST": -4, "NST": -3.5, "GMT": 0, "UTC": 0, "BST": 1, "CET": 1, "CEST": 2,
+           "EET": 2, "EEST": 3, "MSK": 3, "IST": 5.5, "PKT": 5, "SGT": 8, "HKT": 8, "JST": 9, "KST": 9,
+           "AEST": 10, "AEDT": 11, "NZST": 12, "NZDT": 13}
+
+def parse_tz(text):
+    """'UTC-5', '-5:30', 'EST', 'America/Toronto' -> a tzinfo, or None."""
+    t = (text or "").strip()
+    if not t:
+        return None
+    up = t.upper()
+    if up in TZ_ABBR:
+        return datetime.timezone(datetime.timedelta(hours=TZ_ABBR[up]))
+    m = re.match(r"^(?:UTC|GMT)?\s*([+-])\s*(\d{1,2})(?::?(\d{2}))?$", t, re.I)
+    if m:
+        mins = int(m.group(2)) * 60 + int(m.group(3) or 0)
+        return datetime.timezone(datetime.timedelta(minutes=-mins if m.group(1) == "-" else mins))
+    try:
+        from zoneinfo import ZoneInfo
+        return ZoneInfo(t)
+    except Exception:  # noqa - unknown name, or no tz database on this Windows
+        return None
+
+
+def fmt_offset(td):
+    mins = int(round(td.total_seconds() / 60))
+    sign = "-" if mins < 0 else "+"
+    mins = abs(mins)
+    return "UTC%s%d%s" % (sign, mins // 60, (":%02d" % (mins % 60)) if mins % 60 else "")
+
+
+def tz_now_text(text, now=None):
+    tz = parse_tz(text)
+    if tz is None:
+        return "(type UTC-5, EST or America/Toronto)" if (text or "").strip() else ""
+    now = (now or datetime.datetime.now(datetime.timezone.utc)).astimezone(tz)
+    return "there it is %s (%s)" % (now.strftime("%a %H:%M"), fmt_offset(now.utcoffset()))
+
+
+def parse_clock(text):
+    """'3:15 pm', '15:15', '3pm' -> minutes after midnight, or None."""
+    m = re.fullmatch(r"\s*(\d{1,2})(?::(\d{2}))?\s*([ap]\.?m\.?)?\s*", (text or "").lower())
+    if not m:
+        return None
+    h, mi, ap = int(m.group(1)), int(m.group(2) or 0), m.group(3)
+    if mi > 59 or h > 23:
+        return None
+    if ap:
+        if h < 1 or h > 12:
+            return None
+        h = h % 12 + (12 if ap.startswith("p") else 0)
+    return h * 60 + mi
+
+
+def offset_from_times(their_text, my_text, my_offset=None):
+    """'Their clock says X while mine says Y' -> 'UTC-5' (rounded to 15 minutes), or None."""
+    a, b = parse_clock(their_text), parse_clock(my_text)
+    if a is None or b is None:
+        return None
+    if my_offset is None:
+        my_offset = datetime.datetime.now().astimezone().utcoffset()
+    diff = (a - b + 720) % 1440 - 720          # -12h .. +12h
+    mins = int(round((my_offset.total_seconds() / 60 + diff) / 15.0)) * 15
+    return fmt_offset(datetime.timedelta(minutes=mins))
+
+
+def parse_birthday(text):
+    """Returns (year or None, month, day) for 2008-03-05, 03-05, March 5, 5 March 2008 ... or None."""
+    import calendar
+    t = (text or "").strip().replace(",", " ")
+    t = re.sub(r"\s+", " ", t)
+    names = {n.lower(): i for i, n in enumerate(calendar.month_name) if n}
+    names.update({n.lower(): i for i, n in enumerate(calendar.month_abbr) if n})
+    y = mo = d = None
+    m = re.fullmatch(r"(\d{4})[-/.](\d{1,2})[-/.](\d{1,2})", t)
+    if m:
+        y, mo, d = int(m.group(1)), int(m.group(2)), int(m.group(3))
+    else:
+        m = re.fullmatch(r"(\d{1,2})[-/.](\d{1,2})", t)
+        if m:
+            a, b = int(m.group(1)), int(m.group(2))
+            mo, d = (b, a) if a > 12 else (a, b)
+        else:
+            m = re.fullmatch(r"([A-Za-z]+)\.? (\d{1,2})(?: (\d{4}))?", t)
+            if m and m.group(1).lower() in names:
+                mo, d, y = names[m.group(1).lower()], int(m.group(2)), int(m.group(3)) if m.group(3) else None
+            else:
+                m = re.fullmatch(r"(\d{1,2}) ([A-Za-z]+)\.?(?: (\d{4}))?", t)
+                if m and m.group(2).lower() in names:
+                    mo, d, y = names[m.group(2).lower()], int(m.group(1)), int(m.group(3)) if m.group(3) else None
+    if mo is None:
+        return None
+    try:
+        datetime.date(y or 2000, mo, d)
+    except ValueError:
+        return None
+    return y, mo, d
+
+
+def birthday_hint(text, today=None):
+    b = parse_birthday(text)
+    if not (text or "").strip():
+        return ""
+    if b is None:
+        return "(try 2008-03-05, 03-05 or March 5)"
+    y, mo, d = b
+    today = today or datetime.date.today()
+
+    def on(year):
+        try:
+            return datetime.date(year, mo, d)
+        except ValueError:      # Feb 29 in a non-leap year
+            return datetime.date(year, 3, 1)
+    nxt = on(today.year)
+    if nxt < today:
+        nxt = on(today.year + 1)
+    days = (nxt - today).days
+    when = "birthday today" if days == 0 else "birthday in %d day%s" % (days, "" if days == 1 else "s")
+    if y:
+        age = today.year - y - ((today.month, today.day) < (mo, d))
+        return "age %d, %s" % (age, when)
+    return when
+
+
+REAL_LIFE_PRESET = {"name": "Real life", "link_template": "", "display_name": False, "hide_core": True,
+                    "fields": ["Real name", "Location", "Timezone", "Birthday", "Phone", "Email",
+                               "How we know each other"],
+                    "buttons": "", "default": False}
+
+PRESET_LIBRARY = [
+    {"name": "GitHub", "link_template": "https://github.com/{username}", "display_name": True,
+     "fields": ["Bio", "Location", "Created"], "buttons": "", "default": False,
+     "lookups": [{"label": "2ghId", "api": "gh_user", "src": "username", "dst": "id"},
+                 {"label": "2ghUser", "api": "gh_id", "src": "id", "dst": "username"}],
+     "scan": "gh_user", "scan_src": "username",
+     "about": "Username <-> numeric ID and profile (bio, location, created). No key; 60 requests/hour per IP."},
+    {"name": "Bluesky", "link_template": "https://bsky.app/profile/{username}", "display_name": True,
+     "fields": ["Bio"], "buttons": "", "default": False,
+     "lookups": [{"label": "2did", "api": "bsky_resolve", "src": "username", "dst": "id"},
+                 {"label": "2handle", "api": "bsky_profile", "src": "id", "dst": "username"}],
+     "scan": "bsky_profile", "scan_src": "username",
+     "about": "Handle <-> DID and profile (display name, bio). No key."},
+    {"name": "Steam", "link_template": "https://steamcommunity.com/profiles/{id}", "display_name": True,
+     "fields": ["Country"], "buttons": "", "default": False,
+     "lookups": [{"label": "2steamId", "api": "steam_resolve", "src": "username", "dst": "id"}],
+     "scan": "steam_profile", "scan_src": "id",
+     "about": "Vanity name -> SteamID64, then profile data. Needs a free Steam Web API key (Settings > API keys)."},
+    {"name": "Reddit", "link_template": "https://www.reddit.com/user/{username}", "display_name": False,
+     "fields": ["Bio"], "buttons": "", "default": False,
+     "lookups": [{"label": "2redditId", "api": "reddit_user", "src": "username", "dst": "id"}],
+     "scan": "reddit_user", "scan_src": "username",
+     "about": "Public profile JSON. No key. Reddit may refuse requests at times (HTTP 429/403). Not checked against docs."},
+    {"name": "Chess.com", "link_template": "https://www.chess.com/member/{username}", "display_name": True,
+     "fields": ["Location"], "buttons": "", "default": False,
+     "lookups": [{"label": "2chessId", "api": "chess_user", "src": "username", "dst": "id"}],
+     "scan": "chess_user", "scan_src": "username",
+     "about": "Public player profile. No key. Not checked against docs."},
+    {"name": "Lichess", "link_template": "https://lichess.org/@/{username}", "display_name": False,
+     "fields": ["Bio", "Location"], "buttons": "", "default": False,
+     "scan": "lichess_user", "scan_src": "username",
+     "about": "Public user profile. No key. Not checked against docs."},
+    {"name": "Minecraft", "link_template": "https://namemc.com/profile/{username}", "display_name": False,
+     "fields": [], "buttons": "", "default": False,
+     "lookups": [{"label": "2uuid", "api": "mc_user", "src": "username", "dst": "id"},
+                 {"label": "2mcName", "api": "mc_uuid", "src": "id", "dst": "username"}],
+     "about": "Java name <-> UUID through Mojang. No key. Not checked against docs."},
+    {"name": "Hacker News", "link_template": "https://news.ycombinator.com/user?id={username}",
+     "display_name": False, "fields": ["Bio", "Karma"], "buttons": "", "default": False,
+     "scan": "hn_user", "scan_src": "username",
+     "about": "Public profile (about, karma). No key. Not checked against docs."},
+]
+
+_UA = {"User-Agent": "ModDesk/5 (moderation notebook)", "Accept": "application/json"}
+
+LIB_APIS = {
+    "gh_user": {"method": "GET", "url": "https://api.github.com/users/{value}", "headers": _UA,
+                "extract": "id", "not_found": [404],
+                "fill": {"username": "login", "display": "name", "Bio": "bio", "Location": "location",
+                         "Created": "created_at", "id": "id"}},
+    "gh_id": {"method": "GET", "url": "https://api.github.com/user/{value}", "headers": _UA,
+              "extract": "login", "not_found": [404],
+              "fill": {"username": "login", "display": "name", "Bio": "bio", "Location": "location",
+                       "Created": "created_at"}},
+    "bsky_resolve": {"method": "GET",
+                     "url": "https://public.api.bsky.app/xrpc/com.atproto.identity.resolveHandle?handle={value}",
+                     "headers": _UA, "extract": "did", "not_found": [400, 404]},
+    "bsky_profile": {"method": "GET",
+                     "url": "https://public.api.bsky.app/xrpc/app.bsky.actor.getProfile?actor={value}",
+                     "headers": _UA, "extract": "handle", "not_found": [400, 404],
+                     "fill": {"username": "handle", "display": "displayName", "Bio": "description", "id": "did"}},
+    "steam_resolve": {"method": "GET",
+                      "url": ("https://api.steampowered.com/ISteamUser/ResolveVanityURL/v0001/"
+                              "?key={steam_key}&vanityurl={value}"),
+                      "headers": _UA, "needs": ["steam_key"], "extract": "response.steamid", "not_found": [404]},
+    "steam_profile": {"method": "GET",
+                      "url": ("https://api.steampowered.com/ISteamUser/GetPlayerSummaries/v0002/"
+                              "?key={steam_key}&steamids={value}"),
+                      "headers": _UA, "needs": ["steam_key"], "extract": "response.players.0.personaname",
+                      "not_found": [404],
+                      "fill": {"display": "response.players.0.personaname", "link": "response.players.0.profileurl",
+                               "Country": "response.players.0.loccountrycode"}},
+    "reddit_user": {"method": "GET", "url": "https://www.reddit.com/user/{value}/about.json", "headers": _UA,
+                    "extract": "data.id", "not_found": [404],
+                    "fill": {"username": "data.name", "id": "data.id", "Bio": "data.subreddit.public_description"}},
+    "chess_user": {"method": "GET", "url": "https://api.chess.com/pub/player/{value}", "headers": _UA,
+                   "extract": "player_id", "not_found": [404],
+                   "fill": {"username": "username", "display": "name", "id": "player_id", "Location": "location"}},
+    "lichess_user": {"method": "GET", "url": "https://lichess.org/api/user/{value}", "headers": _UA,
+                     "extract": "id", "not_found": [404],
+                     "fill": {"username": "username", "id": "id", "Bio": "profile.bio",
+                              "Location": "profile.location"}},
+    "mc_user": {"method": "GET", "url": "https://api.mojang.com/users/profiles/minecraft/{value}", "headers": _UA,
+                "extract": "id", "not_found": [204, 404], "fill": {"username": "name"}},
+    "mc_uuid": {"method": "GET", "url": "https://sessionserver.mojang.com/session/minecraft/profile/{value}",
+                "headers": _UA, "extract": "name", "not_found": [204, 404]},
+    "hn_user": {"method": "GET", "url": "https://hacker-news.firebaseio.com/v0/user/{value}.json", "headers": _UA,
+                "extract": "id", "not_found": [404],
+                "fill": {"username": "id", "Bio": "about", "Karma": "karma"}},
+}
+
+DEFAULT_APIS.update(LIB_APIS)
+
+
+def walk_nodes(items):
+    for n in items:
+        yield n
+        if n.get("type") == "group":
+            yield from walk_nodes(n.get("children", []))
+
+
+class TimezoneDialog(tk.Toplevel):
+    """'Their clock says X while mine says Y' -> a UTC offset you can store in the Timezone field."""
+
+    def __init__(self, app, on_pick):
+        super().__init__(app.root)
+        self.on_pick = on_pick
+        self.title("Work out their timezone")
+        self.geometry("420x250")
+        self.resizable(False, False)
+        pad = ttk.Frame(self, padding=14)
+        pad.pack(fill="both", expand=True)
+        ttk.Label(pad, wraplength=380, justify="left",
+                  text="Ask what time it is for them right now, then compare with your own clock.").pack(anchor="w")
+        self.theirs = tk.StringVar()
+        self.mine = tk.StringVar(value=datetime.datetime.now().strftime("%H:%M"))
+        self.out = tk.StringVar(value="")
+        for text, var in (("Their time now (3:15 pm or 15:15)", self.theirs), ("My time now", self.mine)):
+            ttk.Label(pad, text=text).pack(anchor="w", pady=(10, 0))
+            e = ttk.Entry(pad, textvariable=var, width=18)
+            e.pack(anchor="w")
+            var.trace_add("write", self.update)
+            if var is self.theirs:
+                e.focus_set()
+        ttk.Label(pad, textvariable=self.out, font=("Segoe UI", 10, "bold")).pack(anchor="w", pady=10)
+        bar = ttk.Frame(pad)
+        bar.pack(anchor="e", fill="x")
+        ttk.Button(bar, text="Use this", command=self.use).pack(side="right")
+        ttk.Button(bar, text="Cancel", command=self.destroy).pack(side="right", padx=6)
+
+    def update(self, *_):
+        r = offset_from_times(self.theirs.get(), self.mine.get())
+        self.out.set(r or "")
+
+    def use(self):
+        r = offset_from_times(self.theirs.get(), self.mine.get())
+        if not r:
+            messagebox.showinfo(APP_NAME, "Enter both times, like 3:15 pm and 12:15.", parent=self)
+            return
+        self.on_pick(r)
+        self.destroy()
+
+
+class PresetLibraryDialog(tk.Toplevel):
+    """Optional platform presets with ready-made lookup buttons. None of them is added by default."""
+
+    def __init__(self, app):
+        super().__init__(app.root)
+        self.app = app
+        self.title("Preset library")
+        self.geometry("560x420")
+        pad = ttk.Frame(self, padding=12)
+        pad.pack(fill="both", expand=True)
+        ttk.Label(pad, wraplength=520, justify="left",
+                  text="Pick a platform to add it to this profile's presets. Its lookups come with buttons on each "
+                       "account. Endpoints live in apis.json, so you can edit them.").pack(anchor="w")
+        row = ttk.Frame(pad)
+        row.pack(fill="both", expand=True, pady=8)
+        self.lb = tk.Listbox(row, exportselection=False, activestyle="none", height=9)
+        self.lb.pack(side="left", fill="y")
+        self.info = ttk.Label(row, wraplength=300, justify="left", anchor="nw")
+        self.info.pack(side="left", fill="both", expand=True, padx=10)
+        self.lb.bind("<<ListboxSelect>>", lambda e: self.show())
+        bar = ttk.Frame(pad)
+        bar.pack(fill="x")
+        ttk.Button(bar, text="Close", command=self.destroy).pack(side="right")
+        ttk.Button(bar, text="Add to this profile", command=self.add).pack(side="right", padx=6)
+        self.refresh()
+
+    def have(self):
+        return {p.get("name", "").lower() for p in self.app.settings["presets"]}
+
+    def refresh(self):
+        have = self.have()
+        self.lb.delete(0, "end")
+        for p in PRESET_LIBRARY:
+            self.lb.insert("end", p["name"] + ("   (added)" if p["name"].lower() in have else ""))
+        if PRESET_LIBRARY:
+            self.lb.selection_set(0)
+            self.show()
+
+    def show(self):
+        sel = self.lb.curselection()
+        if not sel:
+            return
+        p = PRESET_LIBRARY[sel[0]]
+        needs = "\n\nNeeds a key: Settings > API keys." if "steam" in p["name"].lower() else ""
+        self.info.configure(text="%s\n\nFields: %s\nLink: %s%s" % (
+            p.get("about", ""), ", ".join(p.get("fields", [])) or "-", p.get("link_template", ""), needs))
+
+    def add(self):
+        sel = self.lb.curselection()
+        if not sel:
+            return
+        p = PRESET_LIBRARY[sel[0]]
+        if p["name"].lower() in self.have():
+            messagebox.showinfo(APP_NAME, "'%s' is already in this profile." % p["name"], parent=self)
+            return
+        new = json.loads(json.dumps({k: v for k, v in p.items() if k != "about"}))
+        self.app.settings["presets"].append(new)
+        self.app.save_settings_soon()
+        self.refresh()
+        self.app.status("Added the %s preset. Use + Add platform to use it." % p["name"])
+
+
 def browse_main(urls):
     """Entry for 'moddesk.py --browse URL...': shows the pages in app windows (Edge WebView2 through pywebview)."""
     import webview
+
+    class Api:
+        win = None
+
+        def open_external(self):
+            import webbrowser
+            try:
+                webbrowser.open(self.win.get_current_url())
+            except Exception:  # noqa
+                pass
+
+    js = ("(function(){if(document.getElementById('moddesk-ext'))return;var b=document.createElement('button');"
+          "b.id='moddesk-ext';b.textContent='Open in browser';b.style.cssText='position:fixed;right:12px;bottom:12px;"
+          "z-index:2147483647;padding:8px 12px;border:1px solid #888;border-radius:6px;background:#fff;color:#111;"
+          "font:13px Segoe UI,sans-serif;cursor:pointer;box-shadow:0 1px 4px rgba(0,0,0,.3)';"
+          "b.onclick=function(){if(window.pywebview&&window.pywebview.api){window.pywebview.api.open_external();}};"
+          "(document.body||document.documentElement).appendChild(b);})();")
     for u in urls:
-        webview.create_window("ModDesk browser", u, width=1100, height=800)
+        api = Api()
+        w = webview.create_window("ModDesk browser", u, width=1100, height=800, js_api=api)
+        api.win = w
+
+        def on_loaded(win=w):
+            try:
+                win.evaluate_js(js)
+            except Exception:  # noqa
+                pass
+        w.events.loaded += on_loaded
     store = os.path.join(APP_DIR, "browser-data")
     try:
         os.makedirs(store, exist_ok=True)
@@ -3448,7 +4001,7 @@ def extra_variants(names, leet=False, suffixes=False):
     return out
 
 
-APP_VERSION = "5.0.1"
+APP_VERSION = "5.1.0"
 # Your GitHub repo as owner/name (public). Fills the Settings > Updates box and lets the installer fetch the newest code.
 DEFAULT_UPDATE_REPO = "WebDemon7896/moddesk"
 
@@ -3511,7 +4064,8 @@ DEFAULT_KEYBINDS = {
 SETTING_TOGGLES = [
     ("auto_link", "Fill ID <-> link automatically when leaving a field"),
     ("autofill_scans", "Autofill also runs scans"),
-    ("show_scan", "Show the Scan button on accounts (it uses only Roblox / Discord's own public endpoints)"),
+    ("show_scan", "Show the Scan button on accounts"),
+    ("open_external", "Open links in my normal browser instead of a ModDesk window (middle-click always does)"),
     ("confirm_delete", "Ask before deleting"),
     ("show_tag_text", "Show the tag text next to names in the list"),
 ]
@@ -4112,6 +4666,7 @@ class SettingsWindow(tk.Toplevel):
                        "profile.").pack(anchor="w", pady=(0, 10))
         for text, cmd in [("API keys...", lambda: KeysDialog(self.app)),
                           ("Platform presets...", lambda: PresetsDialog(self.app)),
+                          ("Preset library (GitHub, Bluesky...)", lambda: PresetLibraryDialog(self.app)),
                           ("Tags (colors)...", lambda: TagsDialog(self.app)),
                           ("Set window icon...", self.app.set_icon_file),
                           ("Open apis.json (edit endpoints)", lambda: self.app.open_path(API_FILE)),
@@ -4175,8 +4730,7 @@ class SettingsWindow(tk.Toplevel):
         info = ("Program folder: %s\nProfiles: %s\nOpen profile: %s" % (APP_DIR, PROFILES_DIR, CURRENT_PROFILE))
         ttk.Label(f, text=info, foreground="#555", wraplength=660, justify="left").pack(anchor="w", pady=8)
         ttk.Label(f, wraplength=660, justify="left", font=("Segoe UI", 10, "bold"),
-                  text="Generated by AI (Claude, made by Anthropic). Review the results yourself - matches are "
-                       "leads, not proof.").pack(anchor="w", pady=(10, 0))
+                  text="Matches are leads, not proof - review the results yourself.").pack(anchor="w", pady=(10, 0))
 
     def tab_terms(self, f):
         fr = ttk.Frame(f)
