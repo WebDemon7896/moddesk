@@ -61,7 +61,7 @@ CONF_LEVELS = ["", "Confirmed", "Likely", "Possible", "Guess"]
 
 CONF_NONE = "—"
 
-APP_VERSION = "5.3.0"
+APP_VERSION = "5.4.0"
 
 # Your GitHub repo as owner/name (public). Fills the Settings > Updates box and lets the installer fetch the newest code.
 DEFAULT_UPDATE_REPO = "WebDemon7896/moddesk"
@@ -1725,6 +1725,7 @@ class App:
         if self.save_job:
             self.root.after_cancel(self.save_job)
         self.save_job = self.root.after(400, self.save_now)
+        self.sync_soon()
 
     def save_now(self):
         self.save_job = None
@@ -1878,6 +1879,7 @@ class App:
         sm.add_separator()
         sm.add_command(label="Platform presets...", command=lambda: PresetsDialog(self))
         sm.add_command(label="Preset library (GitHub, Bluesky, Steam...)", command=lambda: PresetLibraryDialog(self))
+        sm.add_command(label="Team sync...", command=lambda: TeamSyncDialog(self))
         sm.add_command(label="Tags (colors)...", command=lambda: TagsDialog(self))
         sm.add_command(label="API keys...", command=lambda: KeysDialog(self))
         sm.add_separator()
@@ -3370,6 +3372,83 @@ class App:
                 seen.append(n)
         UsernameCheckDialog(self, node, seen)
 
+    # ----- team sync -----
+    def sync_cfg(self):
+        c = self.settings.get("sync") or {}
+        return c if c.get("enabled") and str(c.get("url", "")).startswith("http") else None
+
+    def sync_base(self):
+        try:
+            with open(os.path.join(DATA_DIR, SYNC_BASE_FILE), encoding="utf-8") as f:
+                return json.load(f)
+        except (OSError, ValueError):
+            return None
+
+    def sync_schedule(self):
+        if getattr(self, "sync_tick_job", None):
+            self.root.after_cancel(self.sync_tick_job)
+            self.sync_tick_job = None
+        c = self.sync_cfg()
+        if c:
+            self.sync_tick_job = self.root.after(int(c.get("interval", 20)) * 1000, self.sync_tick)
+
+    def sync_tick(self):
+        self.sync_tick_job = None
+        self.sync_run()
+        self.sync_schedule()
+
+    def sync_soon(self):
+        if not self.sync_cfg():
+            return
+        if getattr(self, "sync_job", None):
+            self.root.after_cancel(self.sync_job)
+        self.sync_job = self.root.after(4000, self.sync_run)
+
+    def sync_run(self, report=None):
+        cfg = self.sync_cfg()
+        if not cfg or getattr(self, "sync_busy", False):
+            if report and not cfg:
+                report("Turn on sync and enter the URL first.")
+            return
+        self.sync_busy = True
+        snap = json.loads(json.dumps(self.data.get("items", [])))
+        base = self.sync_base()
+        say = report or self.status
+
+        def ok(res):
+            self.sync_busy = False
+            merged, rev, conflicts = res
+            if json.loads(json.dumps(self.data.get("items", []))) != snap:
+                self.sync_soon()      # you edited while syncing: do not overwrite, sync again shortly
+                return
+            if merged != snap:
+                self.apply_synced(merged)
+            try:
+                os.makedirs(DATA_DIR, exist_ok=True)
+                with open(os.path.join(DATA_DIR, SYNC_BASE_FILE), "w", encoding="utf-8") as f:
+                    json.dump({"rev": rev, "items": merged}, f)
+            except OSError:
+                pass
+            say("Synced at %s%s" % (datetime.datetime.now().strftime("%H:%M:%S"),
+                                    " - %d conflict(s): your version was kept as a copy" % conflicts
+                                    if conflicts else ""))
+
+        def err(e):
+            self.sync_busy = False
+            say("Sync problem: %s" % e)
+        self.worker.run(lambda: sync_once(cfg, snap, base), ok, err)
+
+    def apply_synced(self, items):
+        cur = self.current
+        self.data["items"] = items
+        self.save_now()
+        self.rebuild_tree()
+        if cur:
+            node = next((n for n in walk_nodes(items) if n.get("id") == cur), None)
+            if node is not None and node.get("type") == "user":
+                self.cur_node = node
+                self.render_editor(node)
+
     def keybinds(self):
         b = dict(DEFAULT_KEYBINDS)
         for k, v in self.app_cfg.get("keybinds", {}).items():
@@ -4748,6 +4827,7 @@ class SettingsWindow(tk.Toplevel):
         for text, cmd in [("API keys...", lambda: KeysDialog(self.app)),
                           ("Platform presets...", lambda: PresetsDialog(self.app)),
                           ("Preset library (GitHub, Bluesky...)", lambda: PresetLibraryDialog(self.app)),
+                          ("Team sync...", lambda: TeamSyncDialog(self.app)),
                           ("Tags (colors)...", lambda: TagsDialog(self.app)),
                           ("Set window icon...", self.app.set_icon_file),
                           ("Open apis.json (edit endpoints)", lambda: self.app.open_path(API_FILE)),
@@ -5578,6 +5658,212 @@ class WorkflowDialog(tk.Toplevel):
         self.destroy()
 
 
+# Team sync (Settings > Team sync). Saves to your own server instead of only locally.
+# Protocol: GET <url> -> {"rev": n, "data": {"items": [...]}};  PUT <url> {"base_rev": n, "data": {...}} -> {"rev": n+1}
+# or 409 with the current copy. Both sides merge per person/group (3-way), so two people editing different
+# people never overwrite each other; the same person edited by both keeps both versions.
+SYNC_BASE_FILE = "sync_base.json"
+
+WORKER_JS = """// ModDesk team sync - Cloudflare Worker + KV.
+// Setup: create a KV namespace, bind it to this Worker as MODDESK, add a secret named TEAM_TOKEN.
+// The URL path is the workspace name, e.g. https://your-worker.workers.dev/mod-team
+export default {
+  async fetch(req, env) {
+    if ((req.headers.get("Authorization") || "") !== "Bearer " + env.TEAM_TOKEN)
+      return new Response("unauthorized", { status: 401 });
+    const key = new URL(req.url).pathname.replace(/^\\/+/, "") || "default";
+    const cur = JSON.parse((await env.MODDESK.get(key)) || '{"rev":0,"data":null}');
+    const json = (o, s) => new Response(JSON.stringify(o), { status: s || 200, headers: { "content-type": "application/json" } });
+    if (req.method === "GET") return json(cur);
+    if (req.method === "PUT") {
+      const b = await req.json();
+      if (b.base_rev !== cur.rev) return json(cur, 409);
+      const next = { rev: cur.rev + 1, data: b.data };
+      await env.MODDESK.put(key, JSON.stringify(next));
+      return json({ rev: next.rev });
+    }
+    return new Response("method not allowed", { status: 405 });
+  },
+};
+"""
+
+
+def sync_flatten(items):
+    """Tree -> ({id: {"parent", "data"}}, {parent: [ids in order]}). Group children live in their own entries."""
+    flat, order = {}, {}
+
+    def walk(lst, parent):
+        order[parent] = [n["id"] for n in lst]
+        for n in lst:
+            flat[n["id"]] = {"parent": parent, "data": {k: v for k, v in n.items() if k != "children"}}
+            if n.get("type") == "group":
+                walk(n.get("children", []), n["id"])
+    walk(items, "")
+    return flat, order
+
+
+def sync_merge(base, local, remote):
+    """3-way merge of three item trees. Returns (merged_items, number_of_conflicts)."""
+    bf, _bo = sync_flatten(base or [])
+    lf, lo = sync_flatten(local or [])
+    rf, ro = sync_flatten(remote or [])
+    merged, conflicts = {}, []
+    for i in list(dict.fromkeys(list(rf) + list(lf) + list(bf))):
+        b, lc, r = bf.get(i), lf.get(i), rf.get(i)
+        if lc == r:
+            res = lc
+        elif lc == b:
+            res = r
+        elif r == b:
+            res = lc
+        else:
+            res = r if r is not None else lc
+            if lc is not None and r is not None:
+                conflicts.append(lc)
+        if res is not None:
+            merged[i] = res
+    for e in merged.values():
+        if e["parent"] and (e["parent"] not in merged or merged[e["parent"]]["data"].get("type") != "group"):
+            e["parent"] = ""
+    kids = {}
+    for parent in {e["parent"] for e in merged.values()} | {""}:
+        want = [i for i in ro.get(parent, []) + lo.get(parent, []) if i in merged and merged[i]["parent"] == parent]
+        rest = [i for i, e in merged.items() if e["parent"] == parent and i not in want]
+        kids[parent] = list(dict.fromkeys(want + rest))
+    for c in conflicts:
+        d = json.loads(json.dumps(c["data"]))
+        d["id"] = uid()
+        d["name"] = "%s (conflict - your edit)" % d.get("name", "")
+        if d.get("type") == "group":
+            d["children"] = []
+        merged[d["id"]] = {"parent": c["parent"] if c["parent"] in merged or not c["parent"] else "", "data": d}
+        kids.setdefault(merged[d["id"]]["parent"], []).append(d["id"])
+
+    def build(parent):
+        out = []
+        for i in kids.get(parent, []):
+            n = json.loads(json.dumps(merged[i]["data"]))
+            if n.get("type") == "group":
+                n["children"] = build(i)
+            out.append(n)
+        return out
+    return build(""), len(conflicts)
+
+
+def sync_http(cfg, method, body=None):
+    url = cfg.get("url", "").strip()
+    if not url.lower().startswith("http"):
+        raise RuntimeError("Set the server URL first.")
+    st, reason, _h, text = do_request(method, url, {"Authorization": "Bearer " + cfg.get("token", ""),
+                                                    "Content-Type": "application/json"},
+                                      json.dumps(body) if body is not None else None)
+    if st in (401, 403):
+        raise RuntimeError("The server refused the team key (HTTP %d)." % st)
+    if st >= 500 or st == 404:
+        raise RuntimeError("Server problem: HTTP %d %s" % (st, reason))
+    try:
+        return st, json.loads(text or "{}")
+    except ValueError:
+        raise RuntimeError("The server did not answer with JSON (is the URL right?).")
+
+
+def sync_once(cfg, local_items, base):
+    """Run in a worker thread. base = {"rev", "items"} from the last sync. Returns (items, rev, conflicts)."""
+    conflicts = 0
+    for _attempt in range(4):
+        _st, remote = sync_http(cfg, "GET")
+        rrev = remote.get("rev", 0)
+        ritems = (remote.get("data") or {}).get("items")
+        if ritems is None:
+            merged = local_items
+        else:
+            merged, n = sync_merge((base or {}).get("items"), local_items, ritems)
+            conflicts += n
+        if ritems is not None and sync_flatten(merged) == sync_flatten(ritems):
+            return merged, rrev, conflicts
+        st, res = sync_http(cfg, "PUT", {"base_rev": rrev, "data": {"items": merged}})
+        if st == 200:
+            _st, check = sync_http(cfg, "GET")      # another writer may have raced us on KV: verify, else retry
+            if sync_flatten((check.get("data") or {}).get("items") or []) == sync_flatten(merged):
+                return merged, check.get("rev", res.get("rev", rrev + 1)), conflicts
+        base = {"rev": rrev, "items": ritems or []}
+        local_items = merged
+    raise RuntimeError("Could not finish syncing (too many edits at once). It will retry.")
+
+
+class TeamSyncDialog(tk.Toplevel):
+    def __init__(self, app):
+        super().__init__(app.root)
+        self.app = app
+        self.title("Team sync")
+        self.transient(app.root)
+        cfg = app.settings.setdefault("sync", {"enabled": False, "url": "", "token": "", "interval": 20})
+        self.cfg = cfg
+        pad = ttk.Frame(self, padding=12)
+        pad.pack(fill="both", expand=True)
+        pad.columnconfigure(1, weight=1)
+        ttk.Label(pad, wraplength=520, justify="left", foreground="#555",
+                  text="Share this profile's people with your team through a small server you control "
+                       "(for example a Cloudflare Worker). Changes are merged per person: different people never "
+                       "overwrite each other, and if two of you edit the SAME person, both versions are kept.\n"
+                       "Synced: the list of people and groups. Not synced: presets, tags, settings and API keys."
+                  ).grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 8))
+        self.on = tk.BooleanVar(value=bool(cfg.get("enabled")))
+        self.url = tk.StringVar(value=cfg.get("url", ""))
+        self.tok = tk.StringVar(value=cfg.get("token", ""))
+        self.iv = tk.StringVar(value=str(cfg.get("interval", 20)))
+        ttk.Checkbutton(pad, text="Sync this profile with the server", variable=self.on).grid(
+            row=1, column=1, sticky="w")
+        for r, (label, var, show) in enumerate((("Server URL", self.url, ""), ("Team key", self.tok, "*"),
+                                                ("Check every (seconds)", self.iv, "")), start=2):
+            ttk.Label(pad, text=label).grid(row=r, column=0, sticky="w", pady=2)
+            ttk.Entry(pad, textvariable=var, show=show, width=50).grid(row=r, column=1, sticky="ew", pady=2)
+        self.msg = ttk.Label(pad, text="", wraplength=520, justify="left")
+        self.msg.grid(row=5, column=0, columnspan=2, sticky="w", pady=6)
+        bar = ttk.Frame(pad)
+        bar.grid(row=6, column=0, columnspan=2, sticky="ew")
+        ttk.Button(bar, text="Test connection", command=self.test).pack(side="left")
+        ttk.Button(bar, text="Sync now", command=self.sync_now).pack(side="left", padx=4)
+        ttk.Button(bar, text="Save server script...", command=self.save_script).pack(side="left")
+        ttk.Button(bar, text="Save and close", command=self.done).pack(side="right")
+
+    def apply(self):
+        try:
+            iv = max(5, int(self.iv.get()))
+        except ValueError:
+            iv = 20
+        self.cfg.update({"enabled": bool(self.on.get()), "url": self.url.get().strip(),
+                         "token": self.tok.get().strip(), "interval": iv})
+        self.app.save_settings_soon()
+
+    def test(self):
+        self.apply()
+        cfg = dict(self.cfg)
+        self.msg.config(text="Testing...")
+
+        def ok(res):
+            self.msg.config(text="Connected. Server copy is revision %s." % res)
+        self.app.worker.run(lambda: sync_http(cfg, "GET")[1].get("rev", 0), ok,
+                            lambda e: self.msg.config(text=str(e)))
+
+    def sync_now(self):
+        self.apply()
+        self.app.sync_run(lambda m: self.msg.config(text=m))
+
+    def save_script(self):
+        path = os.path.join(APP_DIR, "moddesk-worker.js")
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(WORKER_JS)
+        self.msg.config(text="Saved %s - paste it into a new Cloudflare Worker (instructions are at the top "
+                             "of the file)." % path)
+        self.app.open_path(APP_DIR)
+
+    def done(self):
+        self.apply()
+        self.app.sync_schedule()
+        self.destroy()
+
+
 # Condo scan services. PLACEHOLDERS: the buttons exist on Roblox and Discord accounts but nothing is called yet.
 # To wire one later, add its endpoints to apis.json and replace the "not wired" branch in CondoDialog.run().
 CONDO_SERVICES = [
@@ -5671,6 +5957,8 @@ def main():
         app.status("Something went wrong - details are in crash.log")
     root.report_callback_exception = report
     root.after(500, app.maybe_tour)
+    app.sync_schedule()
+    root.after(1500, app.sync_run)
     root.mainloop()
 
 
