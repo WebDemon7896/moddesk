@@ -61,7 +61,7 @@ CONF_LEVELS = ["", "Confirmed", "Likely", "Possible", "Guess"]
 
 CONF_NONE = "—"
 
-APP_VERSION = "5.2.0"
+APP_VERSION = "5.3.0"
 
 # Your GitHub repo as owner/name (public). Fills the Settings > Updates box and lets the installer fetch the newest code.
 DEFAULT_UPDATE_REPO = "WebDemon7896/moddesk"
@@ -126,6 +126,9 @@ SETTING_TOGGLES = [
     ("auto_link", "Fill ID <-> link automatically when leaving a field"),
     ("autofill_scans", "Autofill also runs scans"),
     ("show_scan", "Show the Scan button on accounts"),
+    ("workflow_mode", "Workflow mode: adds a Workflow button (source > linked > usernames > Google > socials)"),
+    ("wf_drop_404", "Workflow: hide pages that do not exist (404) from the results"),
+    ("wf_auto_queue", "Workflow: follow links - repeat autofill on newly found accounts"),
     ("confirm_delete", "Ask before deleting"),
     ("show_tag_text", "Show the tag text next to names in the list"),
 ]
@@ -209,6 +212,9 @@ DEFAULT_SETTINGS = {
     "confirm_delete": True,
     "show_tag_text": True,
     "show_scan": True,
+    "workflow_mode": False,
+    "wf_drop_404": True,
+    "wf_auto_queue": True,
     "keys": {"discord_token": "", "bloxlink": []},
     "search_templates": DEFAULT_SEARCH,
 }
@@ -1667,7 +1673,7 @@ class App:
         self.save_settings_soon()
         if key == "show_tag_text":
             self.refresh_tree_items()
-        elif key == "show_scan" and isinstance(self.cur_node, dict):
+        elif key in ("show_scan", "workflow_mode") and isinstance(self.cur_node, dict):
             self.render_editor(self.cur_node)
 
     def load_data(self):
@@ -3218,6 +3224,8 @@ class App:
         ttk.Button(top, text="Autofill", command=lambda: self.autofill_user(node)).pack(side="left", padx=2)
         ttk.Button(top, text="Find socials...", command=lambda: FindDialog(self, node)).pack(side="left", padx=2)
         ttk.Button(top, text="Check usernames...", command=lambda: self.check_usernames(node)).pack(side="left", padx=2)
+        if self.settings.get("workflow_mode"):
+            ttk.Button(top, text="Workflow...", command=lambda: WorkflowDialog(self, node)).pack(side="left", padx=2)
 
         # names
         nf = ttk.LabelFrame(inner, text="Names", padding=6)
@@ -5229,21 +5237,341 @@ class UsernameCheckDialog(tk.Toplevel):
         if not rows:
             self.msg.set("Select Found rows (or run a check) first.")
             return
-        added = 0
-        for site, name, _res, link in rows:
-            plat = next((p for p in self.node["accounts"] if p["platform"].strip().lower() == site.lower()), None)
-            if plat is None:
-                plat = {"platform": site, "entries": []}
-                self.node["accounts"].append(plat)
-            if any(e.get("username", "").lower() == name.lower() for e in plat["entries"]):
-                continue
-            ent = new_entry()
-            ent.update({"username": name, "link": link, "conf": {"level": "Guess", "source": "Username check"}})
-            plat["entries"].append(ent)
-            added += 1
+        n = add_guess_accounts(self.node, [(r[0], r[1], r[3]) for r in rows])
         self.app.changed()
         self.app.rerender(self.node)
-        self.msg.set("Added %d guess account(s) to %s." % (added, self.node["name"]))
+        self.msg.set("Added %d guess account(s) to %s." % (n, self.node["name"]))
+
+    def close(self):
+        self.stop.set()
+        self.destroy()
+
+
+# Workflow mode (Settings > "Workflow mode"). One screen that follows the usual routine:
+# source account -> linked accounts -> usernames -> Google -> other socials one platform at a time.
+WF_STEPS_NOTE = ("1 Source account  >  2 Linked accounts  >  3 Usernames  >  4 Google  >  "
+                 "5 One social at a time: check every name, drop 404s, keep guesses, mark the sure ones.")
+
+
+def add_guess_accounts(node, rows, level="Guess", source="Username check"):
+    """rows = (site, username, link). Adds each as an account with a confidence level; skips duplicates."""
+    added = 0
+    for site, name, link in rows:
+        plat = next((p for p in node["accounts"] if p["platform"].strip().lower() == site.lower()), None)
+        if plat is None:
+            plat = {"platform": site, "entries": []}
+            node["accounts"].append(plat)
+        old = next((e for e in plat["entries"] if e.get("username", "").lower() == name.lower()), None)
+        if old is not None:
+            if level == "Confirmed":
+                old["conf"] = {"level": level, "source": source}
+                added += 1
+            continue
+        ent = new_entry()
+        ent.update({"username": name, "link": link, "conf": {"level": level, "source": source}})
+        plat["entries"].append(ent)
+        added += 1
+    return added
+
+
+def wf_sites(templates):
+    """Checkable platforms: your 'Profile guess' search sites first, then Sherlock's list."""
+    out, seen = [], set()
+    for t in templates:
+        if t.get("group") == "Profile guess" and "{q}" in t.get("url", "") and "search" not in t["url"].lower():
+            out.append({"name": t["name"], "url": t["url"].replace("{q}", "{}"), "type": "status_code",
+                        "code": [400, 404, 410], "spaces": t.get("spaces", True)})
+            seen.add(t["name"].lower())
+    for s in load_sites()[0]:
+        if not s["nsfw"] and s["name"].lower() not in seen:
+            out.append(dict(s, spaces=False))
+    return out
+
+
+class WorkflowDialog(tk.Toplevel):
+    """The whole routine on one screen. Every step is optional; use the ones you need."""
+
+    def __init__(self, app, node):
+        super().__init__(app.root)
+        self.app = app
+        self.node = node
+        self.title("Workflow - %s" % node["name"])
+        self.geometry("1040x760")
+        self.q = queue.Queue()
+        self.stop = threading.Event()
+        self.running = False
+        self.chain_rounds = 0
+        self.sites = []
+        self.shown = []
+        self.counts = {"done": 0, "total": 0}
+
+        ttk.Label(self, text=WF_STEPS_NOTE, foreground="#555", padding=(10, 6)).pack(anchor="w")
+        body = ttk.Frame(self, padding=(10, 0))
+        body.pack(fill="both", expand=True)
+        body.columnconfigure(0, weight=1)
+        body.columnconfigure(1, weight=2)
+        body.rowconfigure(1, weight=1)
+
+        # 1 + 2: source and linked accounts
+        f1 = ttk.LabelFrame(body, text="1-2  Source account and linked accounts", padding=6)
+        f1.grid(row=0, column=0, sticky="nsew", padx=(0, 6), pady=(0, 6))
+        self.src_lbl = ttk.Label(f1, justify="left", wraplength=320)
+        self.src_lbl.pack(anchor="w")
+        bar = ttk.Frame(f1)
+        bar.pack(fill="x", pady=4)
+        ttk.Button(bar, text="Autofill and follow links", command=self.chain).pack(side="left")
+        ttk.Button(bar, text="Refresh", command=self.refresh).pack(side="left", padx=4)
+        self.plats = tk.Listbox(f1, height=8, activestyle="none", exportselection=False)
+        self.plats.pack(fill="both", expand=True)
+        ttk.Label(f1, foreground="#666", wraplength=320, justify="left",
+                  text="Autofill looks up the linked accounts of the source. With 'follow links' on in Settings it "
+                       "repeats on every newly found account (up to 3 rounds).").pack(anchor="w", pady=(4, 0))
+
+        # 3 + 4: usernames and Google
+        f2 = ttk.LabelFrame(body, text="3-4  Usernames and Google", padding=6)
+        f2.grid(row=0, column=1, sticky="nsew", pady=(0, 6))
+        ttk.Label(f2, text="Usernames (one per line). Used by the checks below.").pack(anchor="w")
+        self.names_text = tk.Text(f2, height=6)
+        self.names_text.pack(fill="x", pady=3)
+        gb = ttk.Frame(f2)
+        gb.pack(fill="x")
+        ttk.Button(gb, text="Reload from person", command=self.load_names).pack(side="left")
+        self.web = [t for t in app.settings.get("search_templates", []) if t.get("group") == "Web search"]
+        self.web_var = tk.StringVar(value=self.web[0]["name"] if self.web else "")
+        ttk.Combobox(gb, textvariable=self.web_var, state="readonly", width=34,
+                     values=[t["name"] for t in self.web]).pack(side="left", padx=8)
+        ttk.Button(gb, text="Open Google", command=self.google).pack(side="left")
+
+        # 5: socials
+        f3 = ttk.LabelFrame(body, text="5  Other socials - one platform at a time", padding=6)
+        f3.grid(row=1, column=0, columnspan=2, sticky="nsew")
+        f3.columnconfigure(1, weight=1)
+        f3.rowconfigure(0, weight=1)
+        left = ttk.Frame(f3)
+        left.grid(row=0, column=0, sticky="ns", padx=(0, 8))
+        self.filter_var = tk.StringVar()
+        ttk.Entry(left, textvariable=self.filter_var).pack(fill="x")
+        self.filter_var.trace_add("write", lambda *a: self.fill_sites())
+        fr = ttk.Frame(left)
+        fr.pack(fill="both", expand=True, pady=3)
+        self.slb = tk.Listbox(fr, exportselection=False, activestyle="none", width=26)
+        sb = ttk.Scrollbar(fr, command=self.slb.yview)
+        self.slb.configure(yscrollcommand=sb.set)
+        sb.pack(side="right", fill="y")
+        self.slb.pack(side="left", fill="both", expand=True)
+        self.variants_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(left, text="Also try spelling variants", variable=self.variants_var).pack(anchor="w")
+        ttk.Button(left, text="Check this platform", command=self.start).pack(fill="x", pady=(4, 0))
+        ttk.Button(left, text="Stop", command=self.stop.set).pack(fill="x", pady=2)
+
+        right = ttk.Frame(f3)
+        right.grid(row=0, column=1, sticky="nsew")
+        self.tree = ttk.Treeview(right, columns=("name", "site", "result", "link"), show="headings",
+                                 selectmode="extended")
+        for c, t, w in (("name", "Username", 130), ("site", "Platform", 120), ("result", "Result", 70),
+                        ("link", "Link", 420)):
+            self.tree.heading(c, text=t)
+            self.tree.column(c, width=w, anchor="w")
+        tsb = ttk.Scrollbar(right, command=self.tree.yview)
+        self.tree.configure(yscrollcommand=tsb.set)
+        tsb.pack(side="right", fill="y")
+        self.tree.pack(side="left", fill="both", expand=True)
+        self.tree.bind("<Double-Button-1>", lambda e: self.open_rows(True))
+
+        bot = ttk.Frame(self, padding=10)
+        bot.pack(fill="x")
+        self.msg = tk.StringVar(value="Pick a platform and press Check.")
+        ttk.Label(bot, textvariable=self.msg).pack(side="left")
+        ttk.Button(bot, text="Close", command=self.close).pack(side="right")
+        ttk.Button(bot, text="Mark sure", command=lambda: self.save("Confirmed")).pack(side="right", padx=4)
+        ttk.Button(bot, text="Save as guess", command=lambda: self.save("Guess")).pack(side="right")
+        ttk.Button(bot, text="Irrelevant", command=self.drop).pack(side="right", padx=4)
+        ttk.Button(bot, text="Open all", command=lambda: self.open_rows(False)).pack(side="right")
+        ttk.Button(bot, text="Open selected", command=lambda: self.open_rows(True)).pack(side="right", padx=4)
+        self.protocol("WM_DELETE_WINDOW", self.close)
+        self.sites = wf_sites(app.settings.get("search_templates", []))
+        self.fill_sites()
+        self.load_names()
+        self.refresh()
+
+    # ----- steps 1-2 -----
+    def accounts_found(self):
+        return sum(1 for p in self.node["accounts"] for e in p["entries"]
+                   if e.get("username") or e.get("id") or e.get("link"))
+
+    def refresh(self):
+        have = {}
+        for p in self.node["accounts"]:
+            n = sum(1 for e in p["entries"] if e.get("username") or e.get("id") or e.get("link"))
+            if n:
+                have[p["platform"].strip().lower()] = n
+        main = None
+        for p in self.node["accounts"]:
+            if self.app.preset_of(p).get("buttons") in ("roblox", "discord"):
+                for e in p["entries"]:
+                    if e.get("main") or main is None:
+                        main = (p["platform"], e)
+        self.src_lbl.config(text=("Source: %s  %s / %s" % (main[0], main[1].get("username") or "-",
+                                                           main[1].get("id") or "-")) if main
+                            else "No Roblox/Discord account yet. Add one in the editor first.")
+        self.plats.delete(0, "end")
+        names = [p["name"] for p in self.app.settings["presets"] if p["name"] != "Real life"]
+        for n in names + [x for x in have if x not in [m.lower() for m in names]]:
+            c = have.get(n.lower(), 0)
+            self.plats.insert("end", "%s   %s" % (n, "Found (%d)" % c if c else "-"))
+
+    def chain(self):
+        self.chain_rounds = 0
+        self.run_round()
+
+    def run_round(self):
+        if self.app.autofill_busy:
+            self.after(500, self.run_round)
+            return
+        before = self.accounts_found()
+        self.chain_rounds += 1
+        self.msg.set("Autofill round %d..." % self.chain_rounds)
+        self.app.autofill_user(self.node)
+        self.after(600, lambda: self.wait_round(before))
+
+    def wait_round(self, before):
+        if self.app.autofill_busy:
+            self.after(500, lambda: self.wait_round(before))
+            return
+        self.refresh()
+        self.load_names()
+        grew = self.accounts_found() > before
+        if grew and self.app.settings.get("wf_auto_queue", True) and self.chain_rounds < 3:
+            self.run_round()
+        else:
+            self.msg.set("Linked accounts done (%d found)." % self.accounts_found())
+
+    # ----- steps 3-4 -----
+    def load_names(self):
+        n = self.node
+        names = [n.get("main_name"), n.get("name")] + [a.get("name") for a in n.get("akas", [])]
+        for p in n["accounts"]:
+            for e in p["entries"]:
+                names.append(e.get("username"))
+        out = []
+        for v in names:
+            v = re.sub(r"\s+", "", (v or "").strip())
+            if v and v.lower() not in [x.lower() for x in out]:
+                out.append(v)
+        self.names_text.delete("1.0", "end")
+        self.names_text.insert("1.0", "\n".join(out))
+
+    def names(self):
+        out = []
+        for ln in self.names_text.get("1.0", "end").splitlines():
+            ln = ln.strip()
+            if ln and ln not in out:
+                out.append(ln)
+        return out
+
+    def google(self):
+        t = next((x for x in self.web if x["name"] == self.web_var.get()), None)
+        if not t:
+            self.msg.set("No web search template.")
+            return
+        urls = plan_searches(name_variants(self.names(), limit=25), [t])[:MAX_WINDOWS]
+        if urls:
+            self.app.open_external(urls)
+            self.msg.set("Opened %d search window(s)." % len(urls))
+
+    # ----- step 5 -----
+    def fill_sites(self):
+        low = self.filter_var.get().strip().lower()
+        self.shown = [s for s in self.sites if low in s["name"].lower()]
+        self.slb.delete(0, "end")
+        for s in self.shown:
+            self.slb.insert("end", s["name"])
+        if self.shown:
+            self.slb.selection_set(0)
+
+    def start(self):
+        if self.running:
+            return
+        cur = self.slb.curselection()
+        names = self.names()
+        if not cur or not names:
+            self.msg.set("Pick a platform and enter at least one username.")
+            return
+        site = self.shown[cur[0]]
+        if self.variants_var.get():
+            names = name_variants(names, limit=60)
+        if site.get("spaces") is False:
+            names = [n for n in names if " " not in n]
+        names = names[:MAX_CHECK_JOBS]
+        self.tree.delete(*self.tree.get_children())
+        self.stop.clear()
+        self.running = True
+        self.counts = {"done": 0, "total": len(names)}
+        drop = self.app.settings.get("wf_drop_404", True)
+
+        def one(n):
+            if self.stop.is_set():
+                return
+            res, link = check_site(site, n)
+            self.q.put(("r", site["name"], n, res, link))
+
+        def work():
+            from concurrent.futures import ThreadPoolExecutor
+            with ThreadPoolExecutor(max_workers=12) as ex:
+                list(ex.map(one, names))
+            self.q.put(("end", drop))
+        threading.Thread(target=work, daemon=True).start()
+        self.after(150, self.poll)
+
+    def poll(self):
+        again = self.running
+        drop = self.app.settings.get("wf_drop_404", True)
+        try:
+            while True:
+                m = self.q.get_nowait()
+                if m[0] == "r":
+                    _k, site, name, res, link = m
+                    self.counts["done"] += 1
+                    if res in ("found", "unsure") or (res == "missing" and not drop):
+                        label = {"found": "Exists", "unsure": "Unsure", "missing": "Missing"}[res]
+                        self.tree.insert("", "end", values=(name, site, label, link))
+                else:
+                    self.running = False
+                    again = False
+        except queue.Empty:
+            pass
+        c = self.counts
+        self.msg.set("%s %d/%d - %d to review" % ("Checking" if self.running else "Finished", c["done"], c["total"],
+                                                  len(self.tree.get_children())))
+        if again:
+            self.after(150, self.poll)
+
+    def rows(self, selected):
+        ids = (self.tree.selection() if selected else self.tree.get_children())
+        return [(i, self.tree.item(i, "values")) for i in ids]
+
+    def open_rows(self, selected):
+        urls = [v[3] for _i, v in self.rows(selected)][:MAX_WINDOWS]
+        if urls:
+            self.app.open_external(urls)
+
+    def drop(self):
+        for i, _v in self.rows(True):
+            self.tree.delete(i)
+
+    def save(self, level):
+        rows = self.rows(True)
+        if not rows:
+            self.msg.set("Select rows first.")
+            return
+        n = add_guess_accounts(self.node, [(v[1], v[0], v[3]) for _i, v in rows], level,
+                               "Workflow" if level == "Confirmed" else "Workflow check")
+        for i, _v in rows:
+            self.tree.delete(i)
+        self.app.changed()
+        self.app.rerender(self.node)
+        self.refresh()
+        self.msg.set("Saved %d as %s." % (n, level.lower() if level == "Guess" else "confirmed"))
 
     def close(self):
         self.stop.set()
